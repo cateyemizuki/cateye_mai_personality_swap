@@ -1,8 +1,8 @@
 {
   "manifest_version": 2,
-  "version": "1.4.0",
+  "version": "1.4.1",
   "name": "夺舍麦麦",
-  "description": "把当前人格设定保存为预设，按条件/概率/权重自动或手动切换各聊天流的人格；预设激活时以覆盖式注入改写请求 system 中的官方人格/表达/行为段落（替换而非叠加，避免被模型当作提示注入忽视），配 persona_name 时 replyer 追加、planner 改写宿主末位提醒为\"你现在是{人格名}…\"当前身份说明（v1.4.0），planner 外壳 {bot_name} 随 persona_name 人格化（v1.3.9）；持久化记录替换状态，重启不丢；命令结果主动回显（短文本直发、长文本合并转发）；/mps debug 开关开启后每次人格变换通知触发的聊天流；插件根 preset/ 随包预设加载时自动导入数据目录；脚本侧提供跨重载/重启保留的持久 KV 与 @/bot 身份判定（ctx.kv_*、ctx.at_*、ctx.bot_*、ctx.is_at_me，v1.3.7 起）。",
+  "description": "把当前人格设定保存为预设，按条件/概率/权重自动或手动切换各聊天流的人格，支持 /mps delete 删除预设（删前自动备份、激活流回退主人格、清权重，v1.4.1）；预设激活时以覆盖式注入改写请求 system 中的官方人格/表达/行为段落（替换而非叠加，避免被模型当作提示注入忽视），配 persona_name 时 replyer 追加、planner 改写宿主末位提醒为\"你现在是{人格名}…\"当前身份说明（v1.4.0），planner 外壳 {bot_name} 随 persona_name 人格化（v1.3.9）；持久化记录替换状态，重启不丢；命令结果主动回显（短文本直发、长文本合并转发）；/mps debug 开关开启后每次人格变换通知触发的聊天流；插件根 preset/ 随包预设加载时自动导入数据目录；脚本侧提供跨重载/重启保留的持久 KV 与 @/bot 身份判定（ctx.kv_*、ctx.at_*、ctx.bot_*、ctx.is_at_me，v1.3.7 起）。",
   "author": {
     "name": "cateye",
     "url": "https://github.com/cateyemizuki"

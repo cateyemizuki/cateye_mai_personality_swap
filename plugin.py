@@ -90,7 +90,7 @@ _BUNDLED_PRESET_DIR = "preset"
 _STREAM_KEY_CACHE_MAX = 4096
 
 # 配置版本：与 _manifest.json 的 version 保持同步（1.2.3 起为硬性要求）
-SUPPORTED_CONFIG_VERSION = "1.4.0"
+SUPPORTED_CONFIG_VERSION = "1.4.1"
 
 
 # ======================================================================
@@ -1177,7 +1177,7 @@ class MaiPersonalitySwapPlugin(MaiBotPlugin):
 
     @Command(
         "mps",
-        description="夺舍麦麦：/mps maisave [名称] [时长] | maisave list | maiload <名称> | swap [名称] [时长] | weight <名称> <权重> | debug [true|false] | script [list|reload] | status（swap 不带名称=切回主人格）",
+        description="夺舍麦麦：/mps maisave [名称] [时长] | maisave list | maisave delete <名称> | maiload <名称> | swap [名称] [时长] | weight <名称> <权重> | debug [true|false] | script [list|reload] | delete <名称> | status（swap 不带名称=切回主人格）",
         pattern=r"^/mps(?:\s+(?P<rest>.+))?\s*$",
     )
     async def handle_mps(
@@ -1250,7 +1250,7 @@ class MaiPersonalitySwapPlugin(MaiBotPlugin):
     # 这些命令会写预设/改权重/debug 开关/重载执行脚本——普通群成员不应可调。
     # 管理员判定：本地 operator / 控制台，或命中配置的管理员名单（见
     # _is_admin_call）。
-    _OPERATOR_SUBS = frozenset({"maisave", "save", "maiload", "weight", "debug", "script"})
+    _OPERATOR_SUBS = frozenset({"maisave", "save", "maiload", "weight", "debug", "script", "delete"})
 
     def _is_admin_call(
         self,
@@ -1329,7 +1329,7 @@ class MaiPersonalitySwapPlugin(MaiBotPlugin):
         if not sub:
             return (
                 False,
-                "用法：/mps maisave [名称] [时长] | maisave list | maiload <名称> | swap [名称] [时长] | weight <名称> <权重> | debug [true|false] | script [list|reload] | status",
+                "用法：/mps maisave [名称] [时长] | maisave list | maisave delete <名称> | maiload <名称> | swap [名称] [时长] | weight <名称> <权重> | debug [true|false] | script [list|reload] | delete <名称> | status",
                 True,
             )
         # 管理子命令鉴权：operator 或配置的管理员名单，否则拒绝
@@ -1360,15 +1360,20 @@ class MaiPersonalitySwapPlugin(MaiBotPlugin):
             return await self._cmd_status()
         if sub in ("list",):
             return await self._cmd_list()
+        if sub == "delete":
+            return await self._cmd_delete(args)
         if sub == "script":
             return self._cmd_script(args)
         return False, f"未知子命令：{sub}", True
 
     async def _cmd_maisave(self, args: List[str], stream_id: str) -> Tuple[bool, str, bool]:
-        """/mps maisave [名称] [时长]：保存官方当前人格为预设；``maisave list`` 列出全部。"""
+        """/mps maisave [名称] [时长]：保存官方当前人格为预设；``maisave list`` 列出全部；
+        ``maisave delete <名称>`` 删除预设。"""
 
         if args and args[0].lower() == "list":
             return await self._cmd_list()
+        if args and args[0].lower() == "delete":
+            return await self._cmd_delete(args[1:])
         name = args[0].strip() if args else ""
         duration_text = args[1].strip() if len(args) > 1 else ""
         if name and not validate_preset_name(name):
@@ -1520,6 +1525,51 @@ class MaiPersonalitySwapPlugin(MaiBotPlugin):
         if not names:
             return True, "还没有任何预设（用 /maisave [名称] [时长] 保存当前人格）", True
         return True, "预设列表：\n" + "\n".join(f"- {name}" for name in names), True
+
+    async def _cmd_delete(self, args: List[str]) -> Tuple[bool, str, bool]:
+        """/mps delete <名称> 或 /mps maisave delete <名称>：删除预设。
+
+        删除前自动备份到数据目录 ``preset/backup/``（与覆盖前备份同机制，受
+        ``backup_limit`` 轮转）。连锁处理：若该预设正被某些聊天流激活，这些流
+        先恢复主人格（避免状态指向已删除文件）；该预设的命令级权重一并清除。
+        """
+
+        name = args[0].strip() if args else ""
+        if not name:
+            return False, "用法：/mps delete <预设名称>（或 /mps maisave delete <预设名称>）", True
+        if not self.store.exists(name):
+            return False, f"预设「{name}」不存在（用 /mps maisave list 查看全部预设）", True
+
+        # 1) 正在激活该预设的聊天流 → 恢复主人格（防状态指向已删除文件）
+        reverted = []
+        try:
+            for key, state in self.state.list_swapped().items():
+                if state.preset == name:
+                    self.script_revert(scope=key, source="command", trigger_stream_id="")
+                    reverted.append(key)
+        except Exception as exc:
+            self._log("warning", f"删除预设「{name}」时回退激活流失败：{exc}")
+
+        # 2) 清除该预设的命令级权重覆盖（若存在）
+        weight_cleared = False
+        try:
+            if name in self.state.load_weight_overrides():
+                self.state.save_weight_override(name, 0)
+                weight_cleared = True
+        except Exception as exc:
+            self._log("warning", f"删除预设「{name}」时清除权重覆盖失败：{exc}")
+
+        # 3) 备份 + 删除文件
+        backup_path = self.store.delete(name, backup=True)
+        notes = []
+        if reverted:
+            notes.append(f"已在 {len(reverted)} 个激活流中恢复主人格")
+        if weight_cleared:
+            notes.append("已清除该预设的命令级权重")
+        note = f"（{'；'.join(notes)}）" if notes else ""
+        backup_note = f"，已备份到 backup/{backup_path.name}" if backup_path else ""
+        self._log("info", f"删除预设「{name}」（source=command{backup_note}）")
+        return True, f"✅ 预设「{name}」已删除{backup_note}{note}", True
 
     def _cmd_script(self, args: List[str]) -> Tuple[bool, str, bool]:
         """/mps script [list|reload]：查看脚本加载状态 / 手动热重载。"""

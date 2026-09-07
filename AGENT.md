@@ -94,9 +94,11 @@
 - **公开**（任何可发指令的用户）：`/mps swap`、`/mps status`、
   `/mps maisave list` / `list`——切换/查看人格属日常功能；
 - **仅管理员**（普通成员会被拒绝并回"仅限管理员"提示）：`/mps maisave`
-  （含 `/maisave` 别名）、`/mps maiload`、`/mps weight`、`/mps debug`、
-  `/mps script`——写预设、改权重/debug、重载脚本均会改插件状态或触发脚本
-  执行，不应暴露给普通群成员。
+  （含 `/maisave` 别名）、`/mps delete <名称>`（v1.4.1，含 `/maisave delete`）、
+  `/mps maiload`、`/mps weight`、`/mps debug`、`/mps script`——写预设、删
+  预设、改权重/debug、重载脚本均会改插件状态或触发脚本执行，不应暴露给普通
+  群成员。删除预设会自动备份（`preset/backup/`），并把正在激活该预设的聊天流
+  恢复主人格、清除其命令级权重。
 
 **管理员如何判定**（满足其一即可）：
 1. 宿主**本地 operator / 控制台**（`is_local_operator=True`，WebUI/终端发起）；

@@ -206,6 +206,23 @@ class PresetStore:
         for path in backups[: max(overflow, 0)]:
             path.unlink(missing_ok=True)
 
+    def delete(self, name: str, *, backup: bool = True) -> Optional[Path]:
+        """删除预设文件；删除前先把当前文件备份到 backup/（同覆盖前备份机制）。
+
+        Returns:
+            备份文件路径（未备份或文件不存在时返回 None）。
+            删除后可用 ``exists(name)`` 确认 False。
+        """
+
+        path = self._preset_path(name)
+        if not path.is_file():
+            return None
+        backup_path: Optional[Path] = None
+        if backup:
+            backup_path = self._backup_existing(name)
+        path.unlink(missing_ok=True)
+        return backup_path
+
 
 def _to_int(value: object, default: int) -> int:
     """宽松转 int；失败取默认。"""
