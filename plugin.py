@@ -90,7 +90,7 @@ _BUNDLED_PRESET_DIR = "preset"
 _STREAM_KEY_CACHE_MAX = 4096
 
 # 配置版本：与 _manifest.json 的 version 保持同步（1.2.3 起为硬性要求）
-SUPPORTED_CONFIG_VERSION = "1.4.1"
+SUPPORTED_CONFIG_VERSION = "1.4.2"
 
 
 # ======================================================================
@@ -101,49 +101,91 @@ SUPPORTED_CONFIG_VERSION = "1.4.1"
 
 
 class PluginSectionConfig(PluginConfigBase):
-    """插件。"""
+    """插件总开关（plugin 配置节）。"""
 
     __ui_label__ = "插件"
     __ui_icon__ = "package"
     __ui_order__ = 0
 
-    enabled: bool = Field(default=True, description="是否启用插件（总开关）")
+    enabled: bool = Field(
+        default=True,
+        description="是否启用插件（总开关）",
+        json_schema_extra={
+            "label": "启用插件",
+            "hint": "插件总开关",
+        },
+    )
     config_version: str = Field(
         default=SUPPORTED_CONFIG_VERSION,
         description="配置版本",
-        json_schema_extra={"hidden": True, "disabled": True},
+        json_schema_extra={
+            "hidden": True,
+            "disabled": True,
+            "label": "配置版本",
+            "hint": "配置版本勿改",
+        },
     )
 
 
 class FilterSectionConfig(PluginConfigBase):
-    """生效范围过滤（脚本接管时仍然生效）。"""
+    """黑白名单与管理员范围（filter 配置节）。"""
 
     __ui_label__ = "黑白名单与管理员（接管时仍生效）"
     __ui_icon__ = "filter"
     __ui_order__ = 1
 
-    group_list: List[str] = Field(default_factory=list, description="群黑白名单（群号列表）")
+    group_list: List[str] = Field(
+        default_factory=list,
+        description="群黑白名单（群号列表）",
+        json_schema_extra={
+            "label": "群黑白名单",
+            "hint": "群黑白名单（群号）",
+        },
+    )
     group_list_mode: Literal["whitelist", "blacklist"] = Field(
         default="blacklist",
         description="群名单模式：whitelist=在名单内才生效；blacklist=在名单内则不生效",
+        json_schema_extra={
+            "label": "群名单模式",
+            "hint": "群黑白名单模式",
+        },
     )
-    private_list: List[str] = Field(default_factory=list, description="私聊黑白名单（QQ号列表）")
+    private_list: List[str] = Field(
+        default_factory=list,
+        description="私聊黑白名单（QQ号列表）",
+        json_schema_extra={
+            "label": "私聊黑白名单",
+            "hint": "私聊黑白名单",
+        },
+    )
     private_list_mode: Literal["whitelist", "blacklist"] = Field(
         default="blacklist",
         description="私聊名单模式：whitelist=在名单内才生效；blacklist=在名单内则不生效",
+        json_schema_extra={
+            "label": "私聊名单模式",
+            "hint": "私聊名单模式",
+        },
     )
     admin_user_ids: List[str] = Field(
         default_factory=list,
         description="管理员 QQ 号列表（可执行 /mps maisave、weight、debug、script 等管理子命令；也接受 platform:user 形态如 qq:123456；留空则仅本地 operator/控制台可用）",
+        json_schema_extra={
+            "label": "管理员 QQ 列表",
+            "hint": "管理员QQ号列表",
+        },
     )
     admin_group_ids: List[str] = Field(
         default_factory=list,
         description="管理员群列表：这些群里任何人可执行管理子命令（群号列表；留空不启用）",
+        json_schema_extra={
+            "label": "管理员群列表",
+            "hint": "管理员群列表",
+        },
     )
 
 
 class ScriptSectionConfig(PluginConfigBase):
-    """自定义脚本（maips）。"""
+    """自定义脚本（maips 配置节）。"""
 
     __ui_label__ = "自定义脚本（maips）"
     __ui_icon__ = "file-code"
@@ -159,37 +201,81 @@ class ScriptSectionConfig(PluginConfigBase):
             "注入恒为覆盖式（无注入方式配置项，不受接管影响）；"
             "脚本引擎随之自动启用（脚本引擎的 timer 间隔与热重载开关不受影响）"
         ),
+        json_schema_extra={
+            "label": "脚本接管配置",
+            "hint": "脚本接管自动替换",
+        },
     )
     enabled: bool = Field(
         default=True,
         description="启用 KubeJS 风格自定义脚本（插件目录 maips/*.py，可放多个脚本，支持条件控制/直接切换人格）；脚本接管开启时本项被忽略（引擎自动启用）",
+        json_schema_extra={
+            "label": "启用脚本",
+            "hint": "启用自定义脚本",
+        },
     )
     tick_interval_sec: int = Field(
         default=60,
         ge=10,
         description="timer 事件触发间隔（秒），同时用于脚本热重载检查",
+        json_schema_extra={
+            "label": "脚本 Timer 间隔（秒）",
+            "hint": "脚本定时间隔秒",
+        },
     )
     auto_reload: bool = Field(
         default=True,
         description="脚本文件变化时自动热重载；关闭后用 /mps script reload 手动重载",
+        json_schema_extra={
+            "label": "自动热重载",
+            "hint": "自动热重载脚本",
+        },
     )
 
 
 class SwapSectionConfig(PluginConfigBase):
-    """替换行为（脚本接管时忽略）。"""
+    """自动替换行为（swap 配置节）。"""
 
     __ui_label__ = "替换行为（脚本接管时忽略）"
     __ui_icon__ = "repeat"
     __ui_order__ = 3
 
-    per_stream: bool = Field(default=True, description="仅触发聊天流替换；关闭后全局替换（所有聊天流共用同一状态）")
-    reroll_during_swap: bool = Field(default=False, description="替换期间是否能再次触发对话（开启后即使当前不是主人格也可再抽一次）")
-    exclude_current: bool = Field(default=False, description="每次替换人格时忽略当前人格（触发时必不抽到当前人格，即必定变更）")
-    probability: float = Field(default=0.1, description="条件全部满足后触发替换的概率（0~1）")
+    per_stream: bool = Field(
+        default=True,
+        description="仅触发聊天流替换；关闭后全局替换（所有聊天流共用同一状态）",
+        json_schema_extra={
+            "label": "仅触发聊天流替换",
+            "hint": "仅作用于当前聊天流",
+        },
+    )
+    reroll_during_swap: bool = Field(
+        default=False,
+        description="替换期间是否能再次触发对话（开启后即使当前不是主人格也可再抽一次）",
+        json_schema_extra={
+            "label": "替换期间可再触发",
+            "hint": "替换期间可再触发",
+        },
+    )
+    exclude_current: bool = Field(
+        default=False,
+        description="每次替换人格时忽略当前人格（触发时必不抽到当前人格，即必定变更）",
+        json_schema_extra={
+            "label": "排除当前人格",
+            "hint": "抽取排除当前人格",
+        },
+    )
+    probability: float = Field(
+        default=0.1,
+        description="条件全部满足后触发替换的概率（0~1）",
+        json_schema_extra={
+            "label": "触发概率",
+            "hint": "条件满足后触发概率",
+        },
+    )
 
 
 class ConditionSectionConfig(PluginConfigBase):
-    """触发条件（脚本接管时忽略）。"""
+    """自动替换触发条件（condition 配置节）。"""
 
     __ui_label__ = "触发条件（脚本接管时忽略）"
     __ui_icon__ = "list-checks"
@@ -198,43 +284,73 @@ class ConditionSectionConfig(PluginConfigBase):
     non_bot_keywords: List[str] = Field(
         default_factory=lambda: ["default"],
         description="非bot消息关键词：普通用户消息命中任一才可触发；留空或仅 [default] 占位则不检查",
+        json_schema_extra={
+            "label": "非bot消息关键词",
+            "hint": "非bot消息关键词",
+        },
     )
     bot_keywords: List[str] = Field(
         default_factory=lambda: ["default"],
         description="bot消息关键词：bot自己发出的消息命中任一才可触发；留空或仅 [default] 占位则不检查",
+        json_schema_extra={
+            "label": "bot消息关键词",
+            "hint": "bot消息关键词",
+        },
     )
     time_windows: List[str] = Field(
         default_factory=list,
         description="时段列表（可多个），如 [\"08:00-12:00\", \"14:00-18:00\"]，支持跨午夜；留空则全天",
+        json_schema_extra={
+            "label": "生效时段",
+            "hint": "生效时段（可多个）",
+        },
     )
 
 
 class WeightsSectionConfig(PluginConfigBase):
-    """权重（脚本接管时忽略）。"""
+    """主人格与预设权重（weights 配置节）。"""
 
     __ui_label__ = "权重（脚本接管时忽略）"
     __ui_icon__ = "scale"
     __ui_order__ = 5
 
-    main: float = Field(default=0.8, description="主人格权重（主人格 = 不注入预设，按官方 bot_config 人格回复）")
+    main: float = Field(
+        default=0.8,
+        description="主人格权重（主人格 = 不注入预设，按官方 bot_config 人格回复）",
+        json_schema_extra={
+            "label": "主人格权重",
+            "hint": "主人格权重",
+        },
+    )
     presets: Dict[str, float] = Field(
         default_factory=dict,
         description="预设权重表：键为预设名称（不带扩展名），值为正数；与主人格权重一起参与抽取，不要求总和为 1",
+        json_schema_extra={
+            "label": "预设权重表",
+            "hint": "预设权重表",
+        },
     )
 
 
 class PresetSectionConfig(PluginConfigBase):
-    """预设（脚本接管时忽略）。"""
+    """预设与备份（preset 配置节）。"""
 
     __ui_label__ = "预设（脚本接管时忽略）"
     __ui_icon__ = "folder"
     __ui_order__ = 6
 
-    backup_limit: int = Field(default=5, description="同名预设覆盖保存时最多保留的备份数")
+    backup_limit: int = Field(
+        default=5,
+        description="同名预设覆盖保存时最多保留的备份数",
+        json_schema_extra={
+            "label": "备份数量上限",
+            "hint": "同名预设备份数上限",
+        },
+    )
 
 
 class CompatSectionConfig(PluginConfigBase):
-    """注入行为（覆盖式注入统一生效，无通道选择配置）。"""
+    """注入行为优化（compat 配置节）。"""
 
     __ui_label__ = "注入行为"
     __ui_icon__ = "shield"
@@ -243,6 +359,10 @@ class CompatSectionConfig(PluginConfigBase):
     suppress_official_temp_style: bool = Field(
         default=True,
         description="预设激活期间忽略官方临时说话风格注入（直接从请求中剔除该消息）",
+        json_schema_extra={
+            "label": "忽略官方临时说话风格",
+            "hint": "忽略官方临时说话风格",
+        },
     )
 
 

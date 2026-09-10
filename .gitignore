@@ -27,7 +27,7 @@ tests/
 .pytest_cache/
 .coverage
 
-# ── maips/ 是用户脚本目录，整体进仓库（覆盖上面的测试排除）────
+# ── maips/ 是用户脚本目录，整体进仓库（覆盖上面的排除规则）────
 !maips/
 !maips/**
 
