@@ -18,7 +18,7 @@ from mps_api import on_event
 #
 # 说明：给两个不同群与一个指定私聊分别固定人格——群成员/私聊在该流说话时
 #       自动切到对应预设（若当前不是该预设）。预设名要真实存在
-#       （/mps maisave list 查看），否则会被 try/except 静默跳过并记日志。
+#       （/mps list 查看），否则会被 try/except 静默跳过并记日志。
 #       群号/QQ 号按实际替换；数字以字符串形式比较（ctx.group_id 是 str）。
 #       ⚠️ 下方目前是**空表**（不路由任何流），请把"群号/QQ号"替换成你自己的：
 #          群号可用 /mps status 或日志里的 group_id 查看；私聊 QQ 号同理。

@@ -42,5 +42,19 @@ tests/
 Thumbs.db
 
 # ── 个人隐私 / 本地专用（不进仓库）───────────────────────────
-主人格.toml          # 主人格设定：个人隐私，仅在本地/数据目录
-commit_template.txt  # 本地提交模板（本仓库约定不进 GitHub）
+# 注意：gitignore 只把「行首 #」当注释，行尾跟注释会让整行变成无效模式，
+#       因此本节的说明一律独立成行。
+# 主人格设定：个人隐私，仅在本地/数据目录
+主人格.toml
+# 本地提交模板（本仓库约定不进 GitHub）
+commit_template.txt
+# 插件中心 Issue 提交文档（本地使用，不随插件上传）
+ISSUE_SUBMISSION.md
+
+# ── 个人人格预设与个人脚本（不进仓库）─────────────────────────
+# 插件根 preset/ 只保留 .gitkeep（交付暂存区，个人预设放本地/数据目录）
+/preset/*.toml
+!/preset/.gitkeep
+# maips/ 随包示例进仓库（见上方 !maips/**），但个人路由脚本不上传
+/maips/lezi_lock.py
+/maips/priestess_swap.py

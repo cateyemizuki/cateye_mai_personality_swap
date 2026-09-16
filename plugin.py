@@ -12,15 +12,21 @@ system 消息里的官方人格/表达/行为段落**改写**为预设内容—�
 误删官方内容；主人格（无预设激活）时 system 原样不动，到期/revert 后即恢复
 官方原样（不修改官方配置文件，仍可逆）。
 
-命令：
-    /mps maisave [名称] [时长]   保存官方当前人格为预设（名称缺省 presetN，时长缺省 0=永久）
-    /mps maisave list            列出全部预设
-    /mps maiload <名称>          合并转发输出指定预设（供手动改回官方配置）
-    /mps swap [名称] [时长]      切换人格；不带名称（留空/0）即切回主人格
-    /mps weight <名称> <权重>    设置预设权重（持久化，重启保留）
-    /mps debug [true|false]      查询/切换 debug 模式（开启后人格变换通知触发聊天流）
-    /mps status                  查看替换状态与剩余时长
-    /maisave [名称] [时长]       等价 /mps maisave
+命令（★ = 仅管理员可用，见 ``_is_admin_call``；status / list 公开）：
+    /mps maisave [名称] [时长]  ★ 保存官方当前人格为预设（名称缺省 presetN，时长缺省 0=永久）
+    /mps maisave list          列出全部预设（只读公开，等价写法：/mps list）
+    /mps maiload <名称>        ★ 合并转发输出指定预设（供手动改回官方配置）
+    /mps swap [名称] [时长]    ★ 切换当前聊天流人格；不带名称（留空/0）即切回主人格
+    /mps weight <名称> <权重>  ★ 设置预设权重（持久化，重启保留；须为有限正数）
+    /mps debug [true|false]   ★ 查询/切换 debug 模式（开启后人格变换通知触发聊天流）
+    /mps status                查看替换状态（公开；非管理员只显示当前聊天流的明细）
+    /mps list                  列出全部预设名称（公开）
+    /maisave [名称] [时长]     ★ 等价 /mps maisave
+
+    权限：管理员 = 本地 operator / 控制台，或 WebUI 插件配置页「黑白名单与管理员」
+    里的 admin_user_ids（QQ 号）/ admin_group_ids（群号，群内任何成员）。两个名单
+    都留空时只有本地 operator/控制台能执行管理命令。v1.4.3 起 /mps swap 也纳入
+    管理命令（切人格会改变整个聊天流的表现）；仍公开的只有 status / list 等只读命令。
 
     命令反馈：宿主只把命令返回的 response 写日志、不自动回显；插件在命令入口
     统一把结果提示主动发给用户（短文本直发；长文本用合并转发，见
@@ -37,7 +43,8 @@ system 消息里的官方人格/表达/行为段落**改写**为预设内容—�
 from __future__ import annotations
 
 import asyncio
-import os
+import json
+import math
 import random
 import shutil
 from pathlib import Path
@@ -45,6 +52,7 @@ from typing import Any, Dict, List, Literal, Optional, Tuple
 
 from maibot_sdk import Command, Field, HookHandler, MaiBotPlugin, PluginConfigBase
 from maibot_sdk.types import HookMode, HookOrder
+from pydantic import field_validator
 
 from .injectors import (
     append_text_item,
@@ -68,6 +76,7 @@ from .swap_engine import (
     draw_persona,
     in_time_window,
     normalize_keywords,
+    parse_preset_weights,
     parse_time_windows,
     text_matches_any,
 )
@@ -90,7 +99,7 @@ _BUNDLED_PRESET_DIR = "preset"
 _STREAM_KEY_CACHE_MAX = 4096
 
 # 配置版本：与 _manifest.json 的 version 保持同步（1.2.3 起为硬性要求）
-SUPPORTED_CONFIG_VERSION = "1.4.2"
+SUPPORTED_CONFIG_VERSION = "1.4.4"
 
 
 # ======================================================================
@@ -168,15 +177,15 @@ class FilterSectionConfig(PluginConfigBase):
     )
     admin_user_ids: List[str] = Field(
         default_factory=list,
-        description="管理员 QQ 号列表（可执行 /mps maisave、weight、debug、script 等管理子命令；也接受 platform:user 形态如 qq:123456；留空则仅本地 operator/控制台可用）",
+        description="管理员 QQ 号列表（可执行 /mps swap、maisave、weight、delete、debug、script 等管理子命令；也接受 platform:user 形态如 qq:123456；留空则仅本地 operator/控制台可用）",
         json_schema_extra={
             "label": "管理员 QQ 列表",
-            "hint": "管理员QQ号列表",
+            "hint": "管理员QQ号列表（手动切人格/建预设都需要）",
         },
     )
     admin_group_ids: List[str] = Field(
         default_factory=list,
-        description="管理员群列表：这些群里任何人可执行管理子命令（群号列表；留空不启用）",
+        description="管理员群列表：这些群里任何人可执行管理子命令（含 /mps swap 手动切人格；群号列表；留空不启用）",
         json_schema_extra={
             "label": "管理员群列表",
             "hint": "管理员群列表",
@@ -320,16 +329,47 @@ class WeightsSectionConfig(PluginConfigBase):
         json_schema_extra={
             "label": "主人格权重",
             "hint": "主人格权重",
+            "order": 0,
         },
     )
-    presets: Dict[str, float] = Field(
-        default_factory=dict,
-        description="预设权重表：键为预设名称（不带扩展名），值为正数；与主人格权重一起参与抽取，不要求总和为 1",
+    presets: str = Field(
+        default="{}",
+        description=(
+            "预设权重表：JSON 文本，键为预设名称（不带扩展名），值为正数。"
+            '例：{"乐子人": 1.5, "普瑞赛斯": 2}；也可一行一条写「乐子人=1.5」。'
+            "与主人格权重一起参与抽取，不要求总和为 1；留空或 {} = 预设不参与抽取。"
+            "（此字段为文本而非对象，是因为 WebUI 的对象控件会把默认值显示成 "
+            "[object Object]；权重也可用聊天命令 /mps weight 设置，命令值优先）"
+        ),
         json_schema_extra={
             "label": "预设权重表",
-            "hint": "预设权重表",
+            "hint": 'JSON 文本，如 {"乐子人": 1.5}；留空=预设不参与抽取',
+            "placeholder": '{"乐子人": 1.5, "普瑞赛斯": 2}',
+            "rows": 4,
+            "order": 1,
+            "example": '{"乐子人": 1.5}',
         },
     )
+
+    @field_validator("presets", mode="before")
+    @classmethod
+    def _coerce_legacy_presets(cls, value: Any) -> str:
+        """兼容旧版配置写法：``[weights.presets]`` 是 TOML 表（dict）时序列化为 JSON 文本。
+
+        v1.4.2 及以前该字段是 ``Dict[str, float]``（WebUI 显示为 ``[object Object]``），
+        v1.4.3 改为 JSON 文本。旧 ``config.toml`` 里遗留的 ``[weights.presets]`` 表
+        经此归一后仍可用（值不丢），下次在 WebUI 保存配置即写回文本形态。
+        """
+
+        if value is None:
+            return "{}"
+        if isinstance(value, str):
+            return value
+        if isinstance(value, dict):
+            return json.dumps(value, ensure_ascii=False)
+        if isinstance(value, (list, tuple)):
+            return json.dumps([str(item) for item in value], ensure_ascii=False)
+        return str(value)
 
 
 class PresetSectionConfig(PluginConfigBase):
@@ -404,6 +444,8 @@ class MaiPersonalitySwapPlugin(MaiBotPlugin):
         self._bot_user_id: str = ""  # bot 自身账号缓存（脚本 ctx.bot_user_id / @ 自我识别用）
         # 覆盖式注入锚点未命中告警：只警告一次/每通道（防刷屏且提示宿主模板可能变更）
         self._anchor_warned = {"replyer": False, "planner": False}
+        # 配置页「预设权重表」解析失败告警：只警告一次（on_config_update 后重置）
+        self._weights_parse_warned = False
 
     def _warn_anchor_miss(self, channel: str) -> None:
         """覆盖式注入锚点未命中时告警一次（每个通道）。
@@ -457,9 +499,12 @@ class MaiPersonalitySwapPlugin(MaiBotPlugin):
             script_loaded = report["loaded"]
             self._script_task = asyncio.create_task(self._script_timer_loop())
         swapped = len(self._state_store.list_swapped())
+        # 提前解析一次权重表：配置页 JSON 写错时在启动日志里就能看到告警
+        weights = self._merged_weights()
         self._log(
             "info",
             f"夺舍麦麦已加载：预设 {len(self._preset_store.list_names())} 个，"
+            f"生效权重 {len(weights)} 项，"
             f"进行中的替换 {swapped} 个，脚本 {script_loaded} 个已载入",
         )
 
@@ -483,10 +528,12 @@ class MaiPersonalitySwapPlugin(MaiBotPlugin):
         config_data: Optional[dict] = None,
         config_version: Optional[str] = None,
     ) -> None:
-        """配置更新：备份上限即时生效。"""
+        """配置更新：备份上限即时生效，并重算预设权重表（解析告警重新计数）。"""
 
         if config_scope == "self" and self._preset_store is not None:
             self._preset_store._backup_limit = max(int(self.config.preset.backup_limit), 0)
+            self._weights_parse_warned = False
+            self._merged_weights()
             self._log("info", "夺舍麦麦配置已更新")
 
     # ------------------------------------------------------------------
@@ -494,21 +541,31 @@ class MaiPersonalitySwapPlugin(MaiBotPlugin):
     # ------------------------------------------------------------------
 
     def _data_base(self) -> Path:
-        """官方插件数据目录；运行时上下文未注入时回退到当前目录。"""
+        """官方插件数据目录（宿主经 ``ctx.paths.data_dir`` 授予的绝对路径）。
+
+        取不到时**显式失败**：早期实现回退 ``Path(".")``，会把 ``preset/``、
+        ``personality/`` 写到 bot 进程的当前工作目录（偏离「只用宿主授予的数据
+        目录」约定，且可能污染部署目录），故改为抛错而不是静默乱写。
+        """
 
         try:
-            return Path(self.ctx.paths.data_dir)
-        except RuntimeError:
-            return Path(".")
+            data_dir = self.ctx.paths.data_dir
+        except (AttributeError, RuntimeError) as exc:
+            raise RuntimeError(
+                "未取得插件数据目录（ctx.paths.data_dir 不可用）；"
+                "为避免写入 bot 工作目录，插件拒绝继续读写预设与状态"
+            ) from exc
+        return Path(data_dir)
 
     def _import_bundled_presets(self) -> None:
-        """把插件根目录 ``preset/`` 暂存区里的预设 .toml 移入数据目录。
+        """把插件根目录 ``preset/`` 暂存区里的预设 .toml 复制进数据目录。
 
         - 插件加载（on_load）时检查一次；
         - 暂存区为空 / 没有 .toml → 忽略；
         - 目标数据目录已存在同名预设 → 跳过该文件（不覆盖用户手动版）并记
           warning；
-        - 成功移动后文件即从暂存区消失（只剩空目录，下次启动忽略）。
+        - **复制而非移动**：插件安装目录内的文件保持原样（不改写安装目录内容），
+          后续加载因「数据目录已存在同名预设」而跳过，不会重复导入。
 
         用途：AI 交付的预设直接放进插件根 ``preset/``，整个插件目录打包部署到
         服务器，启动时即自动进数据目录——用户无需手动进数据目录放文件。
@@ -522,7 +579,7 @@ class MaiPersonalitySwapPlugin(MaiBotPlugin):
             return
         if self._preset_store is None:
             return
-        moved = 0
+        copied = 0
         skipped = 0
         for path in presets:
             name = path.name[: -len(".toml")]
@@ -535,20 +592,16 @@ class MaiPersonalitySwapPlugin(MaiBotPlugin):
                 skipped += 1
                 continue
             try:
-                target = self._preset_store._preset_path(name)
+                target = self._preset_store.preset_path(name)
                 target.parent.mkdir(parents=True, exist_ok=True)
-                try:
-                    # 同盘用原子 rename；跨盘（插件目录与数据目录在不同盘）os.replace
-                    # 会抛 OSError，回退 shutil.move（复制+删源）
-                    os.replace(str(path), str(target))
-                except OSError:
-                    shutil.move(str(path), str(target))
-                moved += 1
+                # copy2 保留元数据；源文件留在插件安装目录，不删除安装目录内容
+                shutil.copy2(str(path), str(target))
+                copied += 1
             except Exception as exc:
                 self._log("warning", f"随包预设 {path.name} 导入失败：{exc}")
                 skipped += 1
-        if moved:
-            self._log("info", f"已从插件目录 preset/ 导入 {moved} 个预设到数据目录"
+        if copied:
+            self._log("info", f"已从插件目录 preset/ 导入 {copied} 个预设到数据目录"
                               + (f"（跳过 {skipped} 个）" if skipped else ""))
 
     def _scripts_dir(self) -> Path:
@@ -577,7 +630,10 @@ class MaiPersonalitySwapPlugin(MaiBotPlugin):
 
         if self._state_store is None:
             base = self._data_base()
-            self._state_store = SwapStateStore(base / "personality")
+            self._state_store = SwapStateStore(
+                base / "personality",
+                on_error=lambda message: self._log("warning", message),
+            )
         return self._state_store
 
     async def _refresh_stream_map(self) -> None:
@@ -700,17 +756,35 @@ class MaiPersonalitySwapPlugin(MaiBotPlugin):
         return self._preset_store.load(state.preset)
 
     def _merged_weights(self) -> Dict[str, float]:
-        """配置页 [weights.presets] 与 /mps weight 持久化覆盖合并（覆盖优先）。"""
+        """配置页「预设权重表」（JSON 文本）与 /mps weight 持久化覆盖合并（覆盖优先）。
 
-        merged: Dict[str, float] = {}
-        for name, value in (self.config.weights.presets or {}).items():
-            try:
-                merged[str(name).strip()] = float(value)
-            except (TypeError, ValueError):
-                continue
+        配置页字段是**文本**而非对象——WebUI 的对象控件会把默认值渲染成
+        ``[object Object]``（见开发文档《02-开发入门/03-配置系统》§5.6），
+        解析交给 :func:`swap_engine.parse_preset_weights`；解析不出条目时
+        告警一次（改配置后重置），本次按空表处理。
+        """
+
+        raw = self.config.weights.presets
+        merged = parse_preset_weights(raw)
+        if not merged:
+            self._warn_weights_parse(raw)
         if self._state_store is not None:
             merged.update(self._state_store.load_weight_overrides())
         return merged
+
+    def _warn_weights_parse(self, raw: Any) -> None:
+        """预设权重表没解析出有效条目时告警一次（防每条消息刷屏）。"""
+
+        text = str(raw or "").strip()
+        if text in ("", "{}", "[]") or self._weights_parse_warned:
+            return
+        self._weights_parse_warned = True
+        self._log(
+            "warning",
+            f"配置页「预设权重表」未解析出有效条目：{text!r}。应填 JSON 文本"
+            '（如 {"乐子人": 1.5}）或一行一条「乐子人=1.5」；本次按空表处理'
+            "（预设不参与自动抽取；命令级权重 /mps weight 不受影响）。",
+        )
 
     # ------------------------------------------------------------------
     # 接管模式（script.takeover）生效参数
@@ -1133,7 +1207,13 @@ class MaiPersonalitySwapPlugin(MaiBotPlugin):
                     pool[name] = float(weight)
             pool = {name: value for name, value in pool.items() if value > 0}
 
-        decision = draw_persona(pool, probability=probability, rng=self._rng)
+        try:
+            decision = draw_persona(pool, probability=probability, rng=self._rng)
+        except Exception as exc:
+            # 抽取异常绝不允许冒泡到宿主 hook（否则该流每轮对话都会失败）；
+            # draw_persona 已自行过滤非有限权重，这里是最后一道保险。
+            self._log("warning", f"人格抽取异常，本轮跳过（{key}）：{exc}")
+            return
         if not decision.rolled or not decision.picked:
             return
 
@@ -1297,7 +1377,7 @@ class MaiPersonalitySwapPlugin(MaiBotPlugin):
 
     @Command(
         "mps",
-        description="夺舍麦麦：/mps maisave [名称] [时长] | maisave list | maisave delete <名称> | maiload <名称> | swap [名称] [时长] | weight <名称> <权重> | debug [true|false] | script [list|reload] | delete <名称> | status（swap 不带名称=切回主人格）",
+        description="夺舍麦麦：/mps swap [名称] [时长]（切换当前聊天流人格，不带名称=切回主人格）| maisave [名称] [时长] | maisave list | maisave delete <名称> | maiload <名称> | weight <名称> <权重> | debug [true|false] | script [list|reload] | status | list（swap/maisave/weight/delete/maiload/debug/script 仅限管理员；status、list 公开）",
         pattern=r"^/mps(?:\s+(?P<rest>.+))?\s*$",
     )
     async def handle_mps(
@@ -1367,10 +1447,13 @@ class MaiPersonalitySwapPlugin(MaiBotPlugin):
         return result
 
     # 需要管理员权限的管理类子命令。
-    # 这些命令会写预设/改权重/debug 开关/重载执行脚本——普通群成员不应可调。
+    # 这些命令会写预设/改权重/debug 开关/重载执行脚本/**路由人格**——普通群成员
+    # 不应可调（v1.4.3 起 `swap` 也纳入：切人格会改变整个聊天流的表现，属于管理操作）。
     # 管理员判定：本地 operator / 控制台，或命中配置的管理员名单（见
-    # _is_admin_call）。
-    _OPERATOR_SUBS = frozenset({"maisave", "save", "maiload", "weight", "debug", "script", "delete"})
+    # _is_admin_call）。仍对所有人开放的是只读命令：`/mps status`、`/mps list`。
+    _OPERATOR_SUBS = frozenset(
+        {"maisave", "save", "maiload", "weight", "debug", "script", "delete", "swap"}
+    )
 
     def _is_admin_call(
         self,
@@ -1381,6 +1464,10 @@ class MaiPersonalitySwapPlugin(MaiBotPlugin):
         platform: str,
     ) -> bool:
         """管理子命令授权判定：operator / 控制台，或配置的管理员名单命中。
+
+        覆盖 ``_OPERATOR_SUBS``：写预设（maisave/delete）、改权重（weight）、
+        改 debug、重载脚本（script）、输出预设（maiload）、**手动切人格（swap，
+        v1.4.3 起）**。``status`` / ``list`` 等只读命令不走本判定。
 
         名单（配置 ``[filter]``，脚本接管时仍生效）：
         - ``admin_user_ids``：QQ 号列表（也接受 ``platform:user`` 形态，
@@ -1429,8 +1516,8 @@ class MaiPersonalitySwapPlugin(MaiBotPlugin):
 
         ``default_sub`` 非空时来自 /maisave 别名：此时整个 rest 都是参数
         （``/maisave <名称> [时长]``），仅当首词恰为 ``list`` 时视为
-        ``/maisave list`` 列出预设。管理类子命令（见 ``_OPERATOR_SUBS``）要求
-        operator 或配置的管理员名单命中，否则拒绝。
+        ``/maisave list`` 列出预设。管理类子命令（见 ``_OPERATOR_SUBS``，v1.4.3
+        起含 ``swap``）要求 operator 或配置的管理员名单命中，否则拒绝。
         """
 
         if not bool(self.config.plugin.enabled):
@@ -1449,11 +1536,17 @@ class MaiPersonalitySwapPlugin(MaiBotPlugin):
         if not sub:
             return (
                 False,
-                "用法：/mps maisave [名称] [时长] | maisave list | maisave delete <名称> | maiload <名称> | swap [名称] [时长] | weight <名称> <权重> | debug [true|false] | script [list|reload] | delete <名称> | status",
+                "用法：/mps swap [名称] [时长]（切换当前聊天流人格，不带名称=切回主人格）| maisave [名称] [时长] | maisave list | maisave delete <名称> | maiload <名称> | weight <名称> <权重> | debug [true|false] | script [list|reload] | status | list\n"
+                "（swap/maisave/weight/delete/maiload/debug/script 仅限管理员；status、list 公开）",
                 True,
             )
-        # 管理子命令鉴权：operator 或配置的管理员名单，否则拒绝
-        if sub in self._OPERATOR_SUBS and not self._is_admin_call(
+        # 管理子命令鉴权：operator 或配置的管理员名单，否则拒绝。
+        # 例外：列出预设是只读操作——`/mps list`、`/mps maisave list`、
+        # `/maisave list` 三种写法等价、一律公开（与 AGENT.md「命令权限」一致）。
+        listing_only = (
+            sub in ("maisave", "save") and bool(args) and args[0].lower() == "list"
+        )
+        if sub in self._OPERATOR_SUBS and not listing_only and not self._is_admin_call(
             is_local_operator=is_local_operator,
             group_id=group_id,
             user_id=user_id,
@@ -1463,7 +1556,7 @@ class MaiPersonalitySwapPlugin(MaiBotPlugin):
             return (
                 False,
                 "该子命令仅限 bot 管理员使用（本地 operator/控制台，或 WebUI 插件配置页 "
-                "「黑白名单与管理员」中配置的管理员 QQ/群）",
+                "「黑白名单与管理员」中配置的管理员 QQ/群）；只读命令 /mps status、/mps list 不受限",
                 True,
             )
         if sub in ("maisave", "save"):
@@ -1477,7 +1570,15 @@ class MaiPersonalitySwapPlugin(MaiBotPlugin):
         if sub == "debug":
             return await self._cmd_debug(args)
         if sub == "status":
-            return await self._cmd_status()
+            return await self._cmd_status(
+                stream_id=stream_id,
+                is_admin=self._is_admin_call(
+                    is_local_operator=is_local_operator,
+                    group_id=group_id,
+                    user_id=user_id,
+                    platform=platform,
+                ),
+            )
         if sub in ("list",):
             return await self._cmd_list()
         if sub == "delete":
@@ -1535,7 +1636,7 @@ class MaiPersonalitySwapPlugin(MaiBotPlugin):
             return False, "用法：/mps maiload <预设名称>", True
         preset = self.store.load(name)
         if preset is None:
-            return False, f"预设「{name}」不存在（用 /mps maisave list 查看全部预设）", True
+            return False, f"预设「{name}」不存在（用 /mps list 查看全部预设）", True
         await self._send_preset_forward(preset, stream_id, header="预设内容（可复制回官方人格配置）")
         return True, f"已发送预设「{name}」的内容", True
 
@@ -1543,6 +1644,8 @@ class MaiPersonalitySwapPlugin(MaiBotPlugin):
         """/mps swap [名称] [时长]：切换当前聊天流（或全局）人格。
 
         不带名称（``/mps swap`` 或 ``/mps swap 0``）时切回主人格。
+        **仅管理员可执行**（v1.4.3 起，见 ``_OPERATOR_SUBS``）：切人格改变的是
+        整个聊天流的表现，属管理操作；权限判定在 ``_dispatch`` 统一完成。
         """
 
         name = args[0].strip() if args else ""
@@ -1560,7 +1663,7 @@ class MaiPersonalitySwapPlugin(MaiBotPlugin):
 
         preset = self.store.load(name)
         if preset is None:
-            return False, f"预设「{name}」不存在（用 /mps maisave list 查看全部预设）", True
+            return False, f"预设「{name}」不存在（用 /mps list 查看全部预设）", True
         duration_minutes = preset.duration_minutes if duration_text == "" else _parse_minutes(duration_text)
         if duration_minutes is None:
             return False, "时长必须是 ≥0 的整数（分钟），0 表示一直替换", True
@@ -1585,6 +1688,9 @@ class MaiPersonalitySwapPlugin(MaiBotPlugin):
             weight = float(args[1].strip())
         except ValueError:
             return False, "权重必须是数字（0 表示清除该预设的命令级权重，回落到配置页数值；正数为生效权重）", True
+        if not math.isfinite(weight):
+            # inf / nan（如手打 1e400、inf）会让抽取时 random.choices 抛异常并冒泡到宿主 hook
+            return False, "权重必须是有限正数（不接受 inf / nan 这类非有限值）", True
         if weight < 0:
             return False, "权重不能是负数", True
         if weight == 0:
@@ -1594,7 +1700,7 @@ class MaiPersonalitySwapPlugin(MaiBotPlugin):
                 return True, f"✅ 已清除预设「{name}」的命令级权重，回落到配置页数值", True
             return True, f"预设「{name}」本就没有命令级权重覆盖（当前生效值见 /mps status 或配置页）", True
         if name not in self.store.list_names():
-            return False, f"预设「{name}」不存在（用 /mps maisave list 查看全部预设）", True
+            return False, f"预设「{name}」不存在（用 /mps list 查看全部预设）", True
         self.state.save_weight_override(name, weight)
         return True, f"✅ 预设「{name}」权重已设为 {weight}（持久化，与配置页中的预设权重合并生效）", True
 
@@ -1619,27 +1725,47 @@ class MaiPersonalitySwapPlugin(MaiBotPlugin):
             return True, "✅ debug 模式已关闭", True
         return False, f"无效参数：{arg}（用法：/mps debug true|false；不带参数查询当前状态）", True
 
-    async def _cmd_status(self) -> Tuple[bool, str, bool]:
-        """/mps status：查看替换状态。"""
+    async def _cmd_status(self, *, stream_id: str = "", is_admin: bool = False) -> Tuple[bool, str, bool]:
+        """/mps status：查看替换状态。
+
+        公开调用（``is_admin=False``）时**只显示当前聊天流**的明细，外加"另有 N 个
+        聊天流非主人格"的计数——状态键就是群号 / QQ 号，全量列出等于让任意群成员
+        枚举其它会话标识；管理员（operator 或配置的管理员名单）可见全量明细。
+        """
 
         swapped = self.state.list_swapped()
         lines = ["【夺舍麦麦状态】"]
-        if not swapped:
-            lines.append("所有聊天流均为主人格")
-        for key, state in swapped.items():
-            lines.append(self._format_swap_state(key, state))
+        if is_admin:
+            if not swapped:
+                lines.append("所有聊天流均为主人格")
+            for key, state in swapped.items():
+                lines.append(self._format_swap_state(key, state))
+        else:
+            key = await self._scope_key_for_stream(stream_id)
+            lines.append(self._format_swap_state(key, self.state.get(key)))
+            others = sum(1 for other in swapped if other != key)
+            if others:
+                lines.append(f"（另有 {others} 个聊天流处于非主人格状态，明细仅管理员可见）")
         names = self.store.list_names()
         lines.append(f"预设共 {len(names)} 个：{'、'.join(names) if names else '（无）'}")
         params = self._effective_swap_params()
         mode = "每聊天流独立" if params["per_stream"] else "全局"
         takeover_note = "（脚本接管中）" if self._takeover_active() else ""
         lines.append(f"替换范围：{mode}{takeover_note}；主人格权重：{params['main_weight']}")
+        preset_weights = params["preset_weights"] or {}
+        if preset_weights:
+            lines.append(
+                "预设权重（配置页「预设权重表」与 /mps weight 合并）："
+                + "、".join(f"{name}={weight:g}" for name, weight in preset_weights.items())
+            )
+        else:
+            lines.append("预设权重：（无——预设不参与自动抽取；可在配置页「预设权重表」或 /mps weight 设置）")
         debug_text = "开启" if self.state.load_debug_flag() else "关闭"
         lines.append(f"debug 模式：{debug_text}（人格变换通知触发聊天流，/mps debug true|false 切换）")
         return True, "\n".join(lines), True
 
     async def _cmd_list(self) -> Tuple[bool, str, bool]:
-        """/mps maisave list：列出全部预设名称。"""
+        """/mps list（等价 /mps maisave list、/maisave list）：列出全部预设名称。"""
 
         names = self.store.list_names()
         if not names:
@@ -1658,7 +1784,7 @@ class MaiPersonalitySwapPlugin(MaiBotPlugin):
         if not name:
             return False, "用法：/mps delete <预设名称>（或 /mps maisave delete <预设名称>）", True
         if not self.store.exists(name):
-            return False, f"预设「{name}」不存在（用 /mps maisave list 查看全部预设）", True
+            return False, f"预设「{name}」不存在（用 /mps list 查看全部预设）", True
 
         # 1) 正在激活该预设的聊天流 → 恢复主人格（防状态指向已删除文件）
         reverted = []

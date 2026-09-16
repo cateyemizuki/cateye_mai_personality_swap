@@ -48,7 +48,7 @@
   （`[时长]` = 默认切换时长，见下"时长语义"）；
   或手工在数据目录 `preset/<预设名>.toml` 创建（格式见第 8 节）。
   **脚本 `ctx.swap` 的目标必须是已存在的预设**，编写脚本前先确认预设名
-  （用户告知，或让用户先执行 `/maisave`；`/mps maisave list` 可列出）。
+  （用户告知，或让用户先执行 `/maisave`；`/mps list` 可列出）。
 - **时长语义（务必区分"预设存续"与"单次切换持续"）**：
   - 预设文件 `preset/<名>.toml` 里的 `duration_minutes` 只是**默认切换时长**——
     当命令/脚本切到该预设且**未显式声明时长**时，作为"本次最多持续多久"生效；
@@ -87,18 +87,21 @@
   重建，无需保留，也不会被脚本宿主读取；留着只会污染目录、可能让用户误以为
   是多余文件或同步进仓库。
 
-### 命令权限（v1.3.1 起，v1.3.5 增加可配置管理员）
+### 命令权限（v1.3.1 起，v1.3.5 增加可配置管理员，v1.4.3 收紧 swap）
 
 插件的 `/mps` 命令按子命令分权限：
 
-- **公开**（任何可发指令的用户）：`/mps swap`、`/mps status`、
-  `/mps maisave list` / `list`——切换/查看人格属日常功能；
-- **仅管理员**（普通成员会被拒绝并回"仅限管理员"提示）：`/mps maisave`
-  （含 `/maisave` 别名）、`/mps delete <名称>`（v1.4.1，含 `/maisave delete`）、
-  `/mps maiload`、`/mps weight`、`/mps debug`、`/mps script`——写预设、删
-  预设、改权重/debug、重载脚本均会改插件状态或触发脚本执行，不应暴露给普通
-  群成员。删除预设会自动备份（`preset/backup/`），并把正在激活该预设的聊天流
-  恢复主人格、清除其命令级权重。
+- **公开**（任何可发指令的用户）：`/mps status`（非管理员只显示当前聊天流的明细，
+  外加"另有 N 个聊天流非主人格"的计数——状态键即群号/QQ 号，不向普通成员列出
+  其它会话标识）、`/mps list`（含
+  `/mps maisave list` / `/maisave list` 两种等价写法）——只读查看，不产生任何副作用；
+- **仅管理员**（普通成员会被拒绝并回"仅限管理员"提示）：`/mps swap`
+  （**v1.4.3 起**，含不带名称的"切回主人格"——切人格会改变整个聊天流的表现，
+  属管理操作）、`/mps maisave`（含 `/maisave` 别名）、`/mps delete <名称>`
+  （v1.4.1，含 `/maisave delete`）、`/mps maiload`、`/mps weight`、`/mps debug`、
+  `/mps script`——写预设、删预设、改权重/debug、重载脚本、切人格均会改插件状态
+  或触发脚本执行，不应暴露给普通群成员。删除预设会自动备份（`preset/backup/`），
+  并把正在激活该预设的聊天流恢复主人格、清除其命令级权重。
 
 **管理员如何判定**（满足其一即可）：
 1. 宿主**本地 operator / 控制台**（`is_local_operator=True`，WebUI/终端发起）；
@@ -109,9 +112,10 @@
 配置项在 WebUI 插件配置页「黑白名单与管理员」节（脚本接管时仍生效）；留空
 则仅本地 operator/控制台可用。
 
-设计给 AI 脚本的需求提示：**让普通用户"按需切换人格"请走 `/mps swap`
-或 maips 路由脚本；不要指望普通用户能执行 `/mps maisave` 等管理命令**——
-管理命令需用户先把自己 QQ/群加进管理员配置。
+设计给 AI 脚本的需求提示：**让普通用户"按需切换人格"只能走 maips 路由脚本
+（`ctx.swap` / 关键词触发）；`/mps swap` 与 `/mps maisave` 都要求用户先把自己的
+QQ/群加进管理员配置**——写给用户的说明里必须点明这一句，否则他们照文档发指令
+会被拒绝（v1.4.3 起 swap 也受管）。
 
 ## 3. 事件与触发时机
 
@@ -282,7 +286,7 @@ ctx.current_preset(scope: str | None = None) -> str | None
 
 **返回/异常/边界**：
 - `swap` 无返回值；成功会广播 `swap` 事件（`ctx.preset/source/duration_minutes`）；
-- `preset` 不存在 → 抛 `ValueError`（脚本应 try/except 或先确认 `/mps maisave list`）；
+- `preset` 不存在 → 抛 `ValueError`（脚本应 try/except 或先确认 `/mps list`）；
 - **黑白名单命中** → 静默拦截（记日志，不抛异常、不切换）；
 - `revert` 在已主人格时幂等（无害）；
 - 判重惯用法（守则 3）：`if ctx.current_preset() != "目标": ctx.swap("目标")`；
@@ -355,7 +359,7 @@ def quiet(ctx):
 | `reroll_during_swap` | bool | `False` | 替换期间是否还能再次抽签（`[swap] reroll_during_swap`） |
 | `exclude_current` | bool | `False` | 每次抽取是否排除当前人格（`[swap] exclude_current`） |
 | `main_weight` | float ≥0 | `0.8` | 主人格在抽取池中的权重（`[weights] main`） |
-| `preset_weights` | dict[str,float] | `{}` | 各预设权重，与主人格一起参与抽取，不要求总和为 1（`[weights.presets]`） |
+| `preset_weights` | dict[str,float] | `{}` | 各预设权重，与主人格一起参与抽取，不要求总和为 1（对应配置页「预设权重表」`[weights.presets]`——v1.4.3 起该字段在配置里是 **JSON 文本**，如 `{"work_mode": 0.5}`，也可一行一条 `work_mode=0.5`；脚本侧仍是 dict）。非有限值（`inf`/`nan`，如手打 `1e400`）会被忽略 |
 | `non_bot_keywords` | list[str] | `[]` | 用户消息关键词条件；命中任一才可触发（空=不检查，无 default 占位语义）（`[condition] non_bot_keywords`） |
 | `bot_keywords` | list[str] | `[]` | bot 消息关键词条件（空=不检查）（`[condition] bot_keywords`） |
 | `time_windows` | list[str] `HH:MM-HH:MM` | `[]` | 时段条件（可多个，支持跨午夜；空=全天）（`[condition] time_windows`） |
@@ -651,8 +655,8 @@ created_at = "2026-09-06T19:00:00+08:00"
   节注入说明）。缺省/空串 = 沿用官方 `bot.nickname`（上述人格化全部不生效，保持
   官方口径）。手工创建预设时填；`/maisave` 保存官方人格时此项为空（回退官方昵称）。
 - **`duration_minutes` = 该预设的"默认切换时长"**：当有人/脚本用
-  `ctx.swap("work_mode")` 或 `/mps swap work_mode`（不带显式时长）切到它时，
-  本次激活最多持续该分钟数，到点自动恢复主人格；`0`（默认推荐）= 一直用、
+  `ctx.swap("work_mode")` 或 `/mps swap work_mode`（不带显式时长；命令需管理员）
+  切到它时，本次激活最多持续该分钟数，到点自动恢复主人格；`0`（默认推荐）= 一直用、
   不自动恢复。显式声明时长时（`ctx.swap("work_mode", duration_minutes=120)` /
   `/mps swap work_mode 120`）以显式值为准，不读文件。
   **它不表示预设会过期**：文件永久存在，随时可再切；改时长只是改"将来默认
@@ -663,9 +667,12 @@ created_at = "2026-09-06T19:00:00+08:00"
 
 1. `/mps script list` — 脚本是否加载、处理器数量、错误详情；
 2. `/mps script reload` — 修改后强制重载；
-3. `/mps status` — 各聊天流当前人格与剩余时长；
-4. `/mps maisave list` — 可用的预设名；
+3. `/mps status` — 各聊天流当前人格与剩余时长、生效预设权重；
+4. `/mps list` — 可用的预设名（公开命令，人人可用）；
 5. 插件日志（debug 级）记录每次注入与切换；`ctx.log(...)` 可输出脚本侧信息。
+
+> 上列命令里 `/mps script *` 需管理员权限（见第 2 节"命令权限"）；`/mps status`、
+> `/mps list` 公开。
 
 ## 10. 已知边界
 
@@ -722,7 +729,7 @@ created_at = "2026-09-06T19:00:00+08:00"
   - **预设文件 → 放进插件目录根部的 `preset/` 文件夹**（`<插件根>/preset/<预设名>.toml`，
     随插件目录一起打包/同步）；插件加载时自动移入数据目录，**无需手动进数据目录**；
   - 路由/触发脚本 → 放进插件目录 `maips/<脚本名>.py`；
-  - 放好后重启/重载插件，验证 `/mps script list` 无 ❌ → `/mps maisave list`
+  - 放好后重启/重载插件，验证 `/mps script list` 无 ❌ → `/mps list`
     能看到导入的预设。
 
 ### A.2 从主人格派生新人格的模板
@@ -777,7 +784,7 @@ created_at = "2026-09-06T19:00:00+08:00"
 
 1. 交付内容 = 每个新人格 1 个 TOML（**放插件根 `preset/`**）+ 路由/触发脚本
    （放 `maips/`，需要时）+ 一段给用户的"怎么验证"说明；
-2. **预设名必须与用户 `/mps maisave list` 的实际预设一致**；脚本 `_PRESETS` /
+2. **预设名必须与用户 `/mps list` 的实际预设一致**；脚本 `_PRESETS` /
    候选里的每个名字都要真实存在，否则运行期抛 `ValueError`（见第 6 节守则 6）；
 3. 脚本健壮性：`ctx.swap` 包 `try/except`；所有触发词判断避开命令消息
    （`ctx.is_command`）；不要在模块顶层做耗时/副作用操作（第 6 节守则 2）；
@@ -785,5 +792,5 @@ created_at = "2026-09-06T19:00:00+08:00"
 5. **清理缓存产物**：交付前删除你测试/编译产生的 `__pycache__` 与 `*.pyc`
    （见第 2 节"交付前清理缓存产物"），确保插件目录树干净；
 6. 交付后提示用户验证路径：重启/重载插件（`preset/` 里的预设自动移入数据目录）
-   → `/mps script list` 无 ❌ → `/mps maisave list` 能看到导入的预设 →
+   → `/mps script list` 无 ❌ → `/mps list` 能看到导入的预设 →
    触发聊天流实测 → 看插件日志「覆盖 system」行确认覆盖注入生效。

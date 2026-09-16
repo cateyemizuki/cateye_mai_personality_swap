@@ -26,6 +26,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any, Callable, List, Optional
 
 # replyer system 模板固定句（zh-CN）
@@ -34,6 +35,33 @@ REPLYER_ANCHOR_B = "你可以参考【回复信息参考】中的信息"
 # planner system 模板行为段锚点
 PLANNER_STYLE_MARK = "的行为风格："
 PLANNER_TAIL_MARK = "\n以上"  # "以上 {bot_name}的行为风格可以帮助你更好地决策"
+
+# 身份段（identity）健全性阈值：官方身份段是"名字行 + 官方人格 + 情绪尾巴"，
+# 远小于下列上限。锚点之前的整段会被删除，因此超过阈值即视为"宿主模板结构已
+# 变化"（例如在锚点前新增了安全规则 / 输出格式 / 群规段落）→ 放弃替换，由
+# 调用方回退追加式，**绝不盲删锚点之前的非身份内容**。
+IDENTITY_MAX_CHARS = 4000
+IDENTITY_MAX_LINES = 60
+
+
+def _looks_like_identity_region(prefix: str) -> bool:
+    """判断"锚点之前的文本"是否可信为官方身份段（保守判定，宁可回退）。
+
+    - 前缀本身为空 → 视为合法（没有身份段可替换）；
+    - 前缀中出现固定句 B → 结构错位，判定异常；
+    - 字符数 / 非空行数超过 ``IDENTITY_MAX_CHARS`` / ``IDENTITY_MAX_LINES``
+      → 判定异常（疑似宿主在身份段之前新增了其它段落）。
+    """
+
+    if not prefix:
+        return True
+    if REPLYER_ANCHOR_B in prefix:
+        return False
+    if len(prefix) > IDENTITY_MAX_CHARS:
+        return False
+    if sum(1 for line in prefix.splitlines() if line.strip()) > IDENTITY_MAX_LINES:
+        return False
+    return True
 
 
 def replace_replyer_system_text(
@@ -51,12 +79,17 @@ def replace_replyer_system_text(
         style_region    = A 行尾 → 固定句 B 开头  # 官方 reply_style 段 → 替换为预设表达
         tail            = text[idx_b:]     # 自固定句 B 起（场景规则等，原样保留）
 
-    任一锚点缺失返回 None（调用方回退追加式）。
+    任一锚点缺失返回 None（调用方回退追加式）；另外，锚点之前的整段会被删除，
+    因此先用 :func:`_looks_like_identity_region` 做健全性检查——前缀明显不是
+    官方身份段（含固定句 B / 长度或行数超限，疑似宿主模板新增了段落）时同样
+    返回 None，**绝不静默删除非身份内容**。
     """
 
     normalized = str(text or "")
     idx_a = normalized.find(REPLYER_ANCHOR_A)
     if idx_a < 0:
+        return None
+    if not _looks_like_identity_region(normalized[:idx_a]):
         return None
     line_end = normalized.find("\n", idx_a)
     a_line = normalized[idx_a:line_end] if line_end != -1 else normalized[idx_a:]
@@ -109,7 +142,11 @@ def replace_planner_system_text(
     动作”“你不是 {bot_name} 本人”“帮{bot_name}搜集信息”等。预设配置了
     ``persona_name`` 时，传该值即可在替换行为段后，把整段文本里出现的官方
     昵称一并替换为 persona_name（外壳也随之人格化，决策模型眼里的 bot 指称
-    从“迷迭香”变成“普瑞赛斯”）。为空 → 只换行为段（旧行为）。
+    从官方昵称变成 persona_name）。为空 → 只换行为段（旧行为）。
+
+    替换采用整词匹配（前后不得紧邻 ASCII 字母/数字/下划线），且官方昵称长度
+    小于 2 时**放弃外壳替换**——单字昵称（如「小」「麦」）做全局子串替换会误改
+    system 里其它无关文本，此时只替换行为段（保守降级）。
 
     找不到相应锚点时返回 None（回退追加）。
     """
@@ -132,11 +169,12 @@ def replace_planner_system_text(
     new_behavior = str(preset_behavior or "").strip()
     replaced = f"{normalized[:idx]}{mark}{new_behavior}{normalized[tail:]}"
 
-    # 人格化外壳：把官方昵称整体替换为 persona_name（若提供且不同）。
+    # 人格化外壳：把官方昵称替换为 persona_name（若提供、不同、且不是单字昵称）。
     # 注意此时行为段 marker 行的“{官方名}的行为风格：”仍含官方名，也会被一并
     # 换成 persona_name——行为段锚点已消费，不再参与二次定位，安全。
-    if shell and bot and shell != bot:
-        replaced = replaced.replace(bot, shell)
+    if shell and bot and shell != bot and len(bot) >= 2:
+        pattern = re.compile(r"(?<![0-9A-Za-z_])" + re.escape(bot) + r"(?![0-9A-Za-z_])")
+        replaced = pattern.sub(lambda _match: shell, replaced)
     return replaced
 
 

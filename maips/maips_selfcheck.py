@@ -26,7 +26,7 @@ import json
 
 from mps_api import on_event
 
-# 测试预设（须已存在；/mps maisave list 确认）
+# 测试预设（须已存在；/mps list 确认）
 _PRESETS = ["p_cheerful", "p_grumpy", "p_quiet"]
 _MAIN = "__main__"
 
@@ -233,7 +233,9 @@ async def maips_selfcheck(ctx):
         await ctx.send_text(
             "[maips自检] swap 事件监听已就绪。请接着发：/mps swap p_cheerful\n"
             "（或 /mps swap 切回主人格），观察日志中的『swap 事件收到』记录，"
-            "确认 swap 事件能收到 scope_key/preset/source。"
+            "确认 swap 事件能收到 scope_key/preset/source。\n"
+            "注意：/mps swap 自 v1.4.3 起需管理员权限（配置页「黑白名单与管理员」"
+            "填管理员群/QQ；或改用本地控制台执行）。"
         )
         return
     elif "maips检查" in text or "全量自检" in text:

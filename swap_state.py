@@ -29,9 +29,10 @@ import json
 import os
 import re
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 STATE_SUFFIX = ".json"
 MAIN_STATE_FILE = "main"
@@ -77,10 +78,26 @@ class SwapState:
 class SwapStateStore:
     """替换状态文件的读写（含惰性到期回写与权重覆盖）。"""
 
-    def __init__(self, base_dir: Path) -> None:
-        """绑定状态根目录（…/personality）。"""
+    def __init__(self, base_dir: Path, *, on_error: Optional[Callable[[str], None]] = None) -> None:
+        """绑定状态根目录（…/personality）。
+
+        ``on_error``：写盘失败时的回调（接插件 logger）。状态写入属"尽力而为"，
+        失败**不向 hook 链抛异常**（否则每轮对话都会因状态文件被占用而失败），
+        而是回调告警——此时该次切换不会持久化，重启后回到主人格。
+        """
 
         self._base_dir = Path(base_dir)
+        self._on_error = on_error
+
+    def _report_write_error(self, message: str) -> None:
+        """报告写盘失败（未注入回调时静默，绝不抛异常）。"""
+
+        if self._on_error is None:
+            return
+        try:
+            self._on_error(message)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # 状态读写
@@ -187,17 +204,36 @@ class SwapStateStore:
         text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
         self._atomic_write_text(self._state_path(key), text)
 
-    @staticmethod
-    def _atomic_write_text(path: Path, text: str) -> None:
-        """把文本原子写入目标文件（同目录临时文件 + os.replace）。
+    def _atomic_write_text(self, path: Path, text: str) -> bool:
+        """把文本原子写入目标文件（同目录临时文件 + ``os.replace``），返回是否成功。
 
-        避免"先截断再写"在并发/崩溃窗口产生半截 JSON；读侧不再需要处理
-        "写了一半"的竞态文件（仍保留对历史损坏文件的容错，见 get()）。
+        - 无需调用方处理"写了一半"的竞态文件（读侧仍保留对历史损坏文件的容错，
+          见 get()）；
+        - 临时文件名带 pid 与随机后缀：同一状态文件被消息 hook / 命令 / 定时器
+          并发写入时不会互相踩踏临时文件（固定临时名在 Windows 下还会因
+          ``os.replace`` 命中被占用文件抛 ``PermissionError``）；
+        - **不向调用方抛异常**：短暂占用做少量重试，最终失败经 ``on_error`` 回调
+          告警并返回 False——状态写入属尽力而为，绝不让异常冒泡到宿主 hook。
         """
 
-        tmp_path = path.with_name(f".{path.name}.tmp")
-        tmp_path.write_text(text, encoding="utf-8")
-        os.replace(str(tmp_path), str(path))
+        tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
+        last_error: Optional[OSError] = None
+        for attempt in range(3):
+            try:
+                with open(tmp_path, "w", encoding="utf-8", newline="\n") as fh:
+                    fh.write(text)
+                os.replace(str(tmp_path), str(path))
+                return True
+            except OSError as exc:
+                last_error = exc
+                if attempt < 2:
+                    time.sleep(0.05)
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        self._report_write_error(f"状态写入失败（{path.name}）：{last_error}")
+        return False
 
     # ------------------------------------------------------------------
     # 工具类查询

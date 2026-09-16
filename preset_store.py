@@ -15,8 +15,10 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import tomllib
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -95,6 +97,11 @@ class PresetStore:
 
         return self._base_dir / BACKUP_DIR_NAME
 
+    def preset_path(self, name: str) -> Path:
+        """单个预设文件路径（公开入口；语义与 :meth:`_preset_path` 完全一致）。"""
+
+        return self._preset_path(name)
+
     def _preset_path(self, name: str) -> Path:
         """单个预设文件路径。
 
@@ -170,9 +177,29 @@ class PresetStore:
         doc["behavior"] = tomlkit.string(preset.behavior, multiline=True)
         doc["duration_minutes"] = int(preset.duration_minutes)
         doc["created_at"] = preset.created_at or datetime.now().astimezone().isoformat()
-        with open(path, "w", encoding="utf-8", newline="\n") as fh:
-            fh.write(tomlkit.dumps(doc))
+        self._atomic_write_text(path, tomlkit.dumps(doc))
         return backup_path
+
+    @staticmethod
+    def _atomic_write_text(path: Path, text: str) -> None:
+        """把文本原子写入目标文件（同目录临时文件 + ``os.replace``）。
+
+        预设正文可能很长，直接 ``open(path, "w")`` 存在"先截断再写"的窗口：
+        写入途中崩溃/断电会留下半截 TOML（读侧按损坏返回 None，表现成"预设
+        消失"）。临时文件名带 pid 与随机后缀，避免并发保存同一预设时互相
+        踩踏临时文件。
+        """
+
+        tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
+        try:
+            with open(tmp_path, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(text)
+            os.replace(str(tmp_path), str(path))
+        finally:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def _backup_existing(self, name: str) -> Optional[Path]:
         """备份旧预设并按上限轮转，返回备份文件路径。"""
