@@ -1,5 +1,65 @@
 # 更新日志
 
+## 1.4.5
+
+> 修复一处**只在私聊暴露**的判空缺陷。功能语义不变，配置版本 `1.4.4 → 1.4.5`
+> （旧配置自动兼容）。
+
+### 修复：私聊时入站观察 hook 每轮抛 AttributeError，导致私聊内自动替换评估等全部失效
+
+**现象**：机器人每收到一条私聊消息，日志就出现一条
+
+```
+观察型 HookHandler github.cateye.mai-personality-swap.mps_receive_observer 执行失败: 'NoneType' object has no attribute 'get'
+  File ".../cateye_mai_personality_swap/plugin.py", line 1028, in on_receive_after_process
+    group_id=str(group_info.get("group_id") or ""),
+AttributeError: 'NoneType' object has no attribute 'get'
+```
+
+**根因**：`on_receive_after_process` 里 `group_info` 的判空守卫**写错了变量**：
+
+```python
+message_info = message.get("message_info") if isinstance(message.get("message_info"), dict) else {}
+group_info = message_info.get("group_info") if isinstance(message_info, dict) else {}   # ← 判错变量
+```
+
+守卫的意图是"`group_info` 不是 dict 就用 `{}` 兜底"，但判的是 `message_info`——
+而上一行已保证它必然是 dict，因此**守卫恒为真**，`None` 被原样透传，
+紧接着 `group_info.get("group_id")` 崩溃。`user_info` 是同一处复制粘贴错误，
+目前因宿主总会提供 `user_info` 而未暴露。
+
+**为什么只在私聊出现**：宿主对私聊给的 `group_info` **就是 `None`**
+（`plugin_runtime/host/message_utils.py:398-407`：`group_info_dict: Optional[...] = None`，
+仅当 `message_info.group_info` 存在时才填充；`chat/message_receive/bot.py:699` 宿主
+自己也写 `if ... .get("group_info") is not None`）。群聊时 `group_info` 是 dict，
+所以群聊路径完全正常——**该缺陷一直存在，直到机器人开始处理私聊才被触发**。
+
+**影响**：该 handler 是 `mode=OBSERVE` + `order=LATE`，异常被宿主 hook 派发器捕获，
+**不中断主流程**（机器人照常回消息），但后果是：
+1. 每条私聊刷一条 `error` 日志；
+2. **该 hook 的后续逻辑全部被跳过** —— 私聊场景下的
+   「stream→群号映射记录、脚本 `message` 事件派发、非 bot 关键词命中收集、
+   自动替换评估」**全部不生效**，即**私聊里的人格自动替换实际是失效的**。
+
+**修法**：守卫改判取出来的值本身：
+
+```python
+group_info = message_info.get("group_info") if isinstance(message_info.get("group_info"), dict) else {}
+user_info = message_info.get("user_info") if isinstance(message_info.get("user_info"), dict) else {}
+```
+
+**验证**：用 AST 从源文件原样抽出该方法的赋值语句，喂两种真实形态载荷执行崩溃点表达式：
+- 私聊（`group_info=None`）→ 兜底为 `{}`，`group_id=""`，不再抛异常；
+- 群聊（`group_info={"group_id": …}`）→ 原样保留，`group_id` 正确；
+- 边界（`message_info` 缺失 / 为 `None` / 为字符串、`group_info` 为字符串）→ 均不崩且兜底为空。
+
+### 已知遗留（未在本次修改）
+
+同一文件另有 2 处相同的错误守卫，位于 `_note_stream_from_message`（L688-689）与
+`_stream_allowed`（L714-715）。它们**不崩**，因为紧随其后还有第二道正确守卫
+（`str(group_info.get("group_id") or "") if isinstance(group_info, dict) else ""`）兜住。
+属于同一模式，建议后续统一，但不影响功能。
+
 ## 1.4.4
 
 > 提交插件中心前的自查修复：1 处真实缺陷、若干健壮性与隐私收敛、1 处声明与

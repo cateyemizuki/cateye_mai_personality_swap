@@ -99,7 +99,7 @@ _BUNDLED_PRESET_DIR = "preset"
 _STREAM_KEY_CACHE_MAX = 4096
 
 # 配置版本：与 _manifest.json 的 version 保持同步（1.2.3 起为硬性要求）
-SUPPORTED_CONFIG_VERSION = "1.4.4"
+SUPPORTED_CONFIG_VERSION = "1.4.5"
 
 
 # ======================================================================
@@ -1092,8 +1092,20 @@ class MaiPersonalitySwapPlugin(MaiBotPlugin):
         script_decision = None
         if self._script_host is not None and not bool(message.get("is_notify")):
             message_info = message.get("message_info") if isinstance(message.get("message_info"), dict) else {}
-            group_info = message_info.get("group_info") if isinstance(message_info, dict) else {}
-            user_info = message_info.get("user_info") if isinstance(message_info, dict) else {}
+            # 守卫必须判“取出来的那个值”，不能判 message_info 本身——上一行已保证它是 dict，
+            # 判它恒为 True，`None` 会原样透传，下面 .get("group_id") 立刻崩。
+            # 私聊时宿主给的就是 group_info=None（host/message_utils.py:398-407
+            # group_info_dict 初始为 None，仅 group_info 存在时才填充），这是合法状态。
+            group_info = (
+                message_info.get("group_info")
+                if isinstance(message_info.get("group_info"), dict)
+                else {}
+            )
+            user_info = (
+                message_info.get("user_info")
+                if isinstance(message_info.get("user_info"), dict)
+                else {}
+            )
             session_id = str(message.get("session_id") or "")
             script_ctx = self._script_host.build_message_context(
                 "message",
