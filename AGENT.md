@@ -38,11 +38,15 @@
   Session 消息、replyer 中为 assistant/带名 user）会被模型误读为"另一个人"或
   "当前仍是旧身份"。该说明既让模型知道那是自己切换前的发言（语气/关系可参考，
   不切断记忆），又锁定当前身份为新人格名。锚点未命中的回退追加路径同样并入。
-- **planner 外壳人格化（v1.3.9 起）**：宿主 planner 模板把 `{bot_name}` 用官方
-  昵称渲染写满外壳（"关注 迷迭香 与用户的对话…""你不是 迷迭香 本人…"）。
-  预设配置了 `persona_name` 时，覆盖注入会同时把外壳里的官方昵称整体替换为
-  persona_name——决策模型眼里的 bot 指称从官方名变人格名（"关注 普瑞赛斯…
-  为 普瑞赛斯 选择动作"）。未配 persona_name → 外壳保持官方昵称（旧行为）。
+- **planner 外壳人格化（v1.3.9 起；v1.4.7 收窄范围）**：宿主 planner 模板把
+  `{bot_name}` 用官方昵称渲染写满外壳（"关注 迷迭香 与用户的对话…""你不是
+  迷迭香 本人…"）。预设配置了 `persona_name` 时，覆盖注入会把这些**已知外壳
+  固定句式**里的官方昵称替换为 persona_name——决策模型眼里的 bot 指称从官方名
+  变人格名（"关注 普瑞赛斯…为 普瑞赛斯 选择动作"）。v1.4.7 起不再对整段 system
+  全文替换：仅 `injectors/system_replace.py` 的 `PLANNER_SHELL_SENTENCES` 列出的
+  句式生效，句式之外的段落（如安全/合规指令里的昵称）保持官方昵称不动；宿主
+  模板改版导致句式未命中时该处外壳保守保持旧名。未配 persona_name → 外壳保持
+  官方昵称（旧行为）。
   replyer 的 identity 名字行自 v1.3.6 起已随 persona_name。
 - 预设从哪来：用户在聊天里发 `/maisave [名称] [时长]` 把当前官方人格保存为预设
   （`[时长]` = 默认切换时长，见下"时长语义"）；
@@ -61,7 +65,9 @@
 
 - 脚本目录：插件目录下的 `maips/`。每个顶层 `.py` 文件是一个独立脚本，
   **数量不限**，全部会被加载；文件按文件名排序依次注册，同文件内按定义顺序。
-- `_` 开头的文件不作为脚本加载（当工具库用，可被其他脚本 `import`）。
+- `_` 开头的文件默认不作为脚本加载（当工具库用，可被其他脚本 `import`）；配置页
+  「加载下划线前缀脚本」（`[script].load_underscore_scripts`，默认关）开启后才
+  加载执行——运维自检工具 `_maips_selfcheck.py` 即属此类，用完即关。
 - 不要创建 `__init__.py`；不要 import 宿主内部模块（`src.*`）。
 - 脚本可用的外部模块：Python 标准库 + `mps_api`（宿主注入的特殊模块，
   无需安装）。`mps_api` 暴露：
@@ -167,6 +173,7 @@ QQ/群加进管理员配置**——写给用户的说明里必须点明这一句
 | `ctx.at_targets()` | list[dict] | （v1.3.7）本消息被 @ 对象摘要：每项 `{"user_id": ..., "nickname": ..., "cardname": ...}`（从 at 段拍平，字段缺省空串）；无 → `[]`。**判断"谁 @ 了谁"用这个** |
 | `ctx.is_at_me` | bool | （v1.3.7）本消息是否 @ 了 **bot 自己**。判定顺序：① at 段 `target_user_id == ctx.bot_user_id`（bot_user_id 为空时跳过）；② 文本层含 `@{bot_nickname}`（与宿主渲染一致：@ bot 在纯文本里是官方昵称；bot_nickname 为空时跳过）。**注意**：不区分 @ 者是不是 bot 自己（bot 自 @ 也命中）——要排除 bot 自触发须同时比较 `ctx.user_id != ctx.bot_user_id`（bot_user_id 为空时此项恒真，配合 `ctx.user_id != ""` 判断是否 bot 发出） |
 | `ctx.debug_enabled` | bool | debug 模式开关（`/mps debug true\|false`，持久化）。依赖 debug 的自检/通知脚本应据此在关闭时静默（见 5.6 与自检脚本） |
+| `ctx.caller_is_admin` | bool | （v1.4.7）本事件**发送者**是否为管理员（配置页 admin_user_ids 裸 QQ 号 / admin_group_ids 命中；消息事件不带本地 operator 标记与 platform，恒按名单判定）。自检/通知类脚本应把它与 `ctx.debug_enabled` 一起作为触发门槛，防止任意成员触发切换/LLM 消耗（见 5.6 与自检脚本） |
 
 **常用组合**（消息分类惯用法）：
 ```python
@@ -287,7 +294,9 @@ ctx.current_preset(scope: str | None = None) -> str | None
 **返回/异常/边界**：
 - `swap` 无返回值；成功会广播 `swap` 事件（`ctx.preset/source/duration_minutes`）；
 - `preset` 不存在 → 抛 `ValueError`（脚本应 try/except 或先确认 `/mps list`）；
-- **黑白名单命中** → 静默拦截（记日志，不抛异常、不切换）；
+- **黑白名单命中** → 静默拦截（记日志，不抛异常、不切换）；v1.4.7 起名单还约束
+  脚本可见性：被拉黑流的消息不派发给任何脚本 handler，脚本 `send_text` 到被拉黑
+  流也会被丢弃；
 - `revert` 在已主人格时幂等（无害）；
 - 判重惯用法（守则 3）：`if ctx.current_preset() != "目标": ctx.swap("目标")`；
   定时任务中判重防每个 tick 重复触发。
@@ -411,7 +420,8 @@ if isinstance(data, dict):
 ### 5.6 其他
 
 - `await ctx.send_text(text)`：协程（**需 `async def` 处理器**），向事件所属聊天流
-  发一条纯文本。仅 `message` / `bot_message` 事件可用（有 `session_id`）；
+  发一条纯文本。仅 `message` / `bot_message` 事件可用（有 `session_id`）；目标流被
+  黑白名单拉黑时**静默丢弃**（v1.4.7，不抛错）；
   无 `session_id`（如 timer）抛 `ValueError`。失败会被宿主记录，不影响脚本。
   示例（在 swap 后播报）：
   ```python
@@ -423,8 +433,11 @@ if isinstance(data, dict):
 - `ctx.log(message)`：写插件日志（info 级，前缀 `[脚本]`）。调试用
   `/mps script list` 看运行期错误、插件日志看 info/debug 输出。
 - `ctx.debug_enabled`（bool）：`/mps debug true|false` 控制（持久化）。自检/
-  通知类脚本应在关闭时**完全静默**（不响应、不发送、不调 LLM），只在开启时工作
-  ——参考 `maips/maips_selfcheck.py` 的写法。
+  通知类脚本应在关闭时**完全静默**（不响应、不发送、不调 LLM），只在开启时工作。
+- `ctx.caller_is_admin`（bool，v1.4.7）：本消息发送者是否命中管理员名单。自检/
+  通知类脚本还应把它作为触发门槛——**两者同时满足才响应**——防止 debug 开启期间
+  任意成员发触发词翻动人格/消耗 LLM token。参考 `maips/_maips_selfcheck.py`（注意
+  该自检脚本 v1.4.7 起下划线前缀、默认不加载）的写法。
 
 ## 6. 编写守则
 

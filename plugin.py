@@ -23,10 +23,12 @@ system 消息里的官方人格/表达/行为段落**改写**为预设内容—�
     /mps list                  列出全部预设名称（公开）
     /maisave [名称] [时长]     ★ 等价 /mps maisave
 
-    权限：管理员 = 本地 operator / 控制台，或 WebUI 插件配置页「黑白名单与管理员」
-    里的 admin_user_ids（QQ 号）/ admin_group_ids（群号，群内任何成员）。两个名单
-    都留空时只有本地 operator/控制台能执行管理命令。v1.4.3 起 /mps swap 也纳入
-    管理命令（切人格会改变整个聊天流的表现）；仍公开的只有 status / list 等只读命令。
+    权限：管理员 = 本地 operator / 控制台，或（宿主管理员 ∪ 插件配置管理员）。
+    插件配置侧为 WebUI 配置页「黑白名单与管理员」里的 admin_user_ids（QQ 号）/
+    admin_group_ids（群号，群内任何成员）；宿主侧为 ``plugin.permission`` 名单
+    （与 admin_util 统一口径，见 ``admin_util.py``）。两侧都为空时只有本地
+    operator/控制台能执行管理命令。v1.4.3 起 /mps swap 也纳入管理命令（切人格
+    会改变整个聊天流的表现）；仍公开的只有 status / list 等只读命令。
 
     命令反馈：宿主只把命令返回的 response 写日志、不自动回显；插件在命令入口
     统一把结果提示主动发给用户（短文本直发；长文本用合并转发，见
@@ -47,6 +49,7 @@ import json
 import math
 import random
 import shutil
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
@@ -54,6 +57,7 @@ from maibot_sdk import Command, Field, HookHandler, MaiBotPlugin, PluginConfigBa
 from maibot_sdk.types import HookMode, HookOrder
 from pydantic import field_validator
 
+from .admin_util import collect_admins, plain_id
 from .injectors import (
     append_text_item,
     assemble_blocks,
@@ -98,8 +102,12 @@ _BUNDLED_PRESET_DIR = "preset"
 # stream_id → 群号/QQ 号 映射缓存上限：超出后裁剪最旧一半（防无界增长）
 _STREAM_KEY_CACHE_MAX = 4096
 
+# stream→键 映射全量刷新（chat.get_all_streams）的最小间隔（秒）：缓存 miss 时
+# 节流，防止 /mps status 这类公开命令在流未入缓存时被反复触发全量拉取
+_STREAM_REFRESH_MIN_INTERVAL_SEC = 5.0
+
 # 配置版本：与 _manifest.json 的 version 保持同步（1.2.3 起为硬性要求）
-SUPPORTED_CONFIG_VERSION = "1.4.5"
+SUPPORTED_CONFIG_VERSION = "1.4.7"
 
 
 # ======================================================================
@@ -109,10 +117,20 @@ SUPPORTED_CONFIG_VERSION = "1.4.5"
 # ======================================================================
 
 
+def _ui_i18n(en_label: str, en_hint: str = "") -> dict:
+    """字段级英文翻译（并入 json_schema_extra；WebUI 界面语言命中 en 时覆盖 label/hint，未命中回退中文）。"""
+
+    entry: Dict[str, str] = {"label": en_label}
+    if en_hint:
+        entry["hint"] = en_hint
+    return {"i18n": {"en": entry}}
+
+
 class PluginSectionConfig(PluginConfigBase):
     """插件总开关（plugin 配置节）。"""
 
     __ui_label__ = "插件"
+    __ui_i18n__ = {"en": {"title": "Plugin", "description": "General switch and config version."}}
     __ui_icon__ = "package"
     __ui_order__ = 0
 
@@ -121,6 +139,7 @@ class PluginSectionConfig(PluginConfigBase):
         description="是否启用插件（总开关）",
         json_schema_extra={
             "label": "启用插件",
+            **_ui_i18n("Enable plugin", "Master switch for the plugin"),
             "hint": "插件总开关",
         },
     )
@@ -131,6 +150,7 @@ class PluginSectionConfig(PluginConfigBase):
             "hidden": True,
             "disabled": True,
             "label": "配置版本",
+            **_ui_i18n("Config version", "Do not edit"),
             "hint": "配置版本勿改",
         },
     )
@@ -140,6 +160,7 @@ class FilterSectionConfig(PluginConfigBase):
     """黑白名单与管理员范围（filter 配置节）。"""
 
     __ui_label__ = "黑白名单与管理员（接管时仍生效）"
+    __ui_i18n__ = {"en": {"title": "Allow/block lists & admins", "description": "Scoping and admin permission (still active during script takeover)."}}
     __ui_icon__ = "filter"
     __ui_order__ = 1
 
@@ -148,6 +169,7 @@ class FilterSectionConfig(PluginConfigBase):
         description="群黑白名单（群号列表）",
         json_schema_extra={
             "label": "群黑白名单",
+            **_ui_i18n("Group allow/block list", "Group IDs (one per entry)"),
             "hint": "群黑白名单（群号）",
         },
     )
@@ -156,6 +178,7 @@ class FilterSectionConfig(PluginConfigBase):
         description="群名单模式：whitelist=在名单内才生效；blacklist=在名单内则不生效",
         json_schema_extra={
             "label": "群名单模式",
+            **_ui_i18n("Group list mode", "whitelist = only listed groups; blacklist = listed groups are excluded"),
             "hint": "群黑白名单模式",
         },
     )
@@ -164,6 +187,7 @@ class FilterSectionConfig(PluginConfigBase):
         description="私聊黑白名单（QQ号列表）",
         json_schema_extra={
             "label": "私聊黑白名单",
+            **_ui_i18n("Private chat allow/block list", "User QQ IDs (one per entry)"),
             "hint": "私聊黑白名单",
         },
     )
@@ -172,14 +196,16 @@ class FilterSectionConfig(PluginConfigBase):
         description="私聊名单模式：whitelist=在名单内才生效；blacklist=在名单内则不生效",
         json_schema_extra={
             "label": "私聊名单模式",
+            **_ui_i18n("Private list mode", "whitelist = only listed users; blacklist = listed users are excluded"),
             "hint": "私聊名单模式",
         },
     )
     admin_user_ids: List[str] = Field(
         default_factory=list,
-        description="管理员 QQ 号列表（可执行 /mps swap、maisave、weight、delete、debug、script 等管理子命令；也接受 platform:user 形态如 qq:123456；留空则仅本地 operator/控制台可用）",
+        description="管理员 QQ 号列表（可执行 /mps swap、maisave、weight、delete、debug、script 等管理子命令；与宿主 plugin.permission 名单合并生效；留空时仅宿主名单与本地 operator/控制台可用）",
         json_schema_extra={
             "label": "管理员 QQ 列表",
+            **_ui_i18n("Admin QQ IDs", "QQ IDs allowed to run admin commands"),
             "hint": "管理员QQ号列表（手动切人格/建预设都需要）",
         },
     )
@@ -188,6 +214,7 @@ class FilterSectionConfig(PluginConfigBase):
         description="管理员群列表：这些群里任何人可执行管理子命令（含 /mps swap 手动切人格；群号列表；留空不启用）",
         json_schema_extra={
             "label": "管理员群列表",
+            **_ui_i18n("Admin groups", "Anyone in these groups can run admin commands"),
             "hint": "管理员群列表",
         },
     )
@@ -197,6 +224,7 @@ class ScriptSectionConfig(PluginConfigBase):
     """自定义脚本（maips 配置节）。"""
 
     __ui_label__ = "自定义脚本（maips）"
+    __ui_i18n__ = {"en": {"title": "Custom scripts (maips)", "description": "Script engine and takeover options."}}
     __ui_icon__ = "file-code"
     __ui_order__ = 2
 
@@ -212,6 +240,7 @@ class ScriptSectionConfig(PluginConfigBase):
         ),
         json_schema_extra={
             "label": "脚本接管配置",
+            **_ui_i18n("Script takeover", "Let maips scripts control swap behavior"),
             "hint": "脚本接管自动替换",
         },
     )
@@ -220,6 +249,7 @@ class ScriptSectionConfig(PluginConfigBase):
         description="启用 KubeJS 风格自定义脚本（插件目录 maips/*.py，可放多个脚本，支持条件控制/直接切换人格）；脚本接管开启时本项被忽略（引擎自动启用）",
         json_schema_extra={
             "label": "启用脚本",
+            **_ui_i18n("Enable scripts", "Load maips/*.py custom scripts"),
             "hint": "启用自定义脚本",
         },
     )
@@ -229,6 +259,7 @@ class ScriptSectionConfig(PluginConfigBase):
         description="timer 事件触发间隔（秒），同时用于脚本热重载检查",
         json_schema_extra={
             "label": "脚本 Timer 间隔（秒）",
+            **_ui_i18n("Script timer interval (sec)", "Timer event interval, also used for hot-reload checks"),
             "hint": "脚本定时间隔秒",
         },
     )
@@ -237,7 +268,22 @@ class ScriptSectionConfig(PluginConfigBase):
         description="脚本文件变化时自动热重载；关闭后用 /mps script reload 手动重载",
         json_schema_extra={
             "label": "自动热重载",
+            **_ui_i18n("Auto hot reload", "Reload scripts when files change"),
             "hint": "自动热重载脚本",
+        },
+    )
+    load_underscore_scripts: bool = Field(
+        default=False,
+        description=(
+            "是否加载下划线前缀脚本（maips/_*.py，如运维自检工具 _maips_selfcheck.py）。"
+            "默认关闭：下划线脚本只作工具库存在、不执行；开启后与普通脚本同样加载执行"
+            "（自检触发仍需 debug 开启 + 管理员发触发词）。仅在自己管理的环境临时开启，"
+            "用完即关"
+        ),
+        json_schema_extra={
+            "label": "加载下划线前缀脚本",
+            **_ui_i18n("Load underscore-prefixed scripts", "Also load maips/_*.py (ops/self-check tools)"),
+            "hint": "默认关闭；自检脚本等运维工具需开启才加载",
         },
     )
 
@@ -246,6 +292,7 @@ class SwapSectionConfig(PluginConfigBase):
     """自动替换行为（swap 配置节）。"""
 
     __ui_label__ = "替换行为（脚本接管时忽略）"
+    __ui_i18n__ = {"en": {"title": "Swap behavior", "description": "Automatic swap behavior (ignored during script takeover)."}}
     __ui_icon__ = "repeat"
     __ui_order__ = 3
 
@@ -254,6 +301,7 @@ class SwapSectionConfig(PluginConfigBase):
         description="仅触发聊天流替换；关闭后全局替换（所有聊天流共用同一状态）",
         json_schema_extra={
             "label": "仅触发聊天流替换",
+            **_ui_i18n("Per-stream swap", "Off = swap globally for all chat streams"),
             "hint": "仅作用于当前聊天流",
         },
     )
@@ -262,6 +310,7 @@ class SwapSectionConfig(PluginConfigBase):
         description="替换期间是否能再次触发对话（开启后即使当前不是主人格也可再抽一次）",
         json_schema_extra={
             "label": "替换期间可再触发",
+            **_ui_i18n("Reroll during swap", "Allow drawing again while a preset is active"),
             "hint": "替换期间可再触发",
         },
     )
@@ -270,6 +319,7 @@ class SwapSectionConfig(PluginConfigBase):
         description="每次替换人格时忽略当前人格（触发时必不抽到当前人格，即必定变更）",
         json_schema_extra={
             "label": "排除当前人格",
+            **_ui_i18n("Exclude current persona", "Never draw the currently active persona"),
             "hint": "抽取排除当前人格",
         },
     )
@@ -278,6 +328,7 @@ class SwapSectionConfig(PluginConfigBase):
         description="条件全部满足后触发替换的概率（0~1）",
         json_schema_extra={
             "label": "触发概率",
+            **_ui_i18n("Trigger probability", "0-1, chance after all conditions are met"),
             "hint": "条件满足后触发概率",
         },
     )
@@ -287,6 +338,7 @@ class ConditionSectionConfig(PluginConfigBase):
     """自动替换触发条件（condition 配置节）。"""
 
     __ui_label__ = "触发条件（脚本接管时忽略）"
+    __ui_i18n__ = {"en": {"title": "Trigger conditions", "description": "Conditions for automatic swap (ignored during script takeover)."}}
     __ui_icon__ = "list-checks"
     __ui_order__ = 4
 
@@ -295,6 +347,7 @@ class ConditionSectionConfig(PluginConfigBase):
         description="非bot消息关键词：普通用户消息命中任一才可触发；留空或仅 [default] 占位则不检查",
         json_schema_extra={
             "label": "非bot消息关键词",
+            **_ui_i18n("User message keywords", "Keywords matched against non-bot messages"),
             "hint": "非bot消息关键词",
         },
     )
@@ -303,6 +356,7 @@ class ConditionSectionConfig(PluginConfigBase):
         description="bot消息关键词：bot自己发出的消息命中任一才可触发；留空或仅 [default] 占位则不检查",
         json_schema_extra={
             "label": "bot消息关键词",
+            **_ui_i18n("Bot message keywords", "Keywords matched against the bot's own messages"),
             "hint": "bot消息关键词",
         },
     )
@@ -311,6 +365,7 @@ class ConditionSectionConfig(PluginConfigBase):
         description="时段列表（可多个），如 [\"08:00-12:00\", \"14:00-18:00\"]，支持跨午夜；留空则全天",
         json_schema_extra={
             "label": "生效时段",
+            **_ui_i18n("Active time windows", "e.g. 08:00-12:00; empty = all day"),
             "hint": "生效时段（可多个）",
         },
     )
@@ -320,6 +375,7 @@ class WeightsSectionConfig(PluginConfigBase):
     """主人格与预设权重（weights 配置节）。"""
 
     __ui_label__ = "权重（脚本接管时忽略）"
+    __ui_i18n__ = {"en": {"title": "Weights", "description": "Draw weights for main persona and presets (ignored during script takeover)."}}
     __ui_icon__ = "scale"
     __ui_order__ = 5
 
@@ -328,6 +384,7 @@ class WeightsSectionConfig(PluginConfigBase):
         description="主人格权重（主人格 = 不注入预设，按官方 bot_config 人格回复）",
         json_schema_extra={
             "label": "主人格权重",
+            **_ui_i18n("Main persona weight", "Weight of the official persona (no preset injected)"),
             "hint": "主人格权重",
             "order": 0,
         },
@@ -343,6 +400,7 @@ class WeightsSectionConfig(PluginConfigBase):
         ),
         json_schema_extra={
             "label": "预设权重表",
+            **_ui_i18n("Preset weight table", 'JSON text, e.g. {"Happy": 1.5}; empty = presets not drawn'),
             "hint": 'JSON 文本，如 {"乐子人": 1.5}；留空=预设不参与抽取',
             "placeholder": '{"乐子人": 1.5, "普瑞赛斯": 2}',
             "rows": 4,
@@ -376,6 +434,7 @@ class PresetSectionConfig(PluginConfigBase):
     """预设与备份（preset 配置节）。"""
 
     __ui_label__ = "预设（脚本接管时忽略）"
+    __ui_i18n__ = {"en": {"title": "Presets", "description": "Preset storage options (ignored during script takeover)."}}
     __ui_icon__ = "folder"
     __ui_order__ = 6
 
@@ -384,6 +443,7 @@ class PresetSectionConfig(PluginConfigBase):
         description="同名预设覆盖保存时最多保留的备份数",
         json_schema_extra={
             "label": "备份数量上限",
+            **_ui_i18n("Backup limit", "Max backups kept when overwriting a preset"),
             "hint": "同名预设备份数上限",
         },
     )
@@ -393,6 +453,7 @@ class CompatSectionConfig(PluginConfigBase):
     """注入行为优化（compat 配置节）。"""
 
     __ui_label__ = "注入行为"
+    __ui_i18n__ = {"en": {"title": "Injection behavior", "description": "Compatibility tuning for overlay injection."}}
     __ui_icon__ = "shield"
     __ui_order__ = 7
 
@@ -401,6 +462,7 @@ class CompatSectionConfig(PluginConfigBase):
         description="预设激活期间忽略官方临时说话风格注入（直接从请求中剔除该消息）",
         json_schema_extra={
             "label": "忽略官方临时说话风格",
+            **_ui_i18n("Ignore official temp style", "Drop official temporary style injection while a preset is active"),
             "hint": "忽略官方临时说话风格",
         },
     )
@@ -437,6 +499,7 @@ class MaiPersonalitySwapPlugin(MaiBotPlugin):
         self._tracker = ConditionTracker()
         self._rng = random.Random()
         self._stream_key_cache: Dict[str, str] = {}  # stream_id → 状态键（群号 / QQ号 / stream_id 兜底）
+        self._last_stream_refresh = 0.0  # 上次全量刷新（monotonic；配合 _STREAM_REFRESH_MIN_INTERVAL_SEC 节流）
         self._script_host: Optional[ScriptHost] = None
         self._script_task: Optional[asyncio.Task] = None
         self._maips_dir_override: Optional[Path] = None  # 脚本目录覆盖（供无插件目录的环境注入）
@@ -446,6 +509,10 @@ class MaiPersonalitySwapPlugin(MaiBotPlugin):
         self._anchor_warned = {"replyer": False, "planner": False}
         # 配置页「预设权重表」解析失败告警：只警告一次（on_config_update 后重置）
         self._weights_parse_warned = False
+        # 宿主管理员名单缓存（plugin.permission 归一后的纯 ID）：供同步脚本路径
+        # （script_caller_is_admin）在不能 await 的场景使用；异步路径每次判定时
+        # 顺带刷新，脚本 timer tick 亦定期刷新
+        self._host_admin_cache: Tuple[str, ...] = ()
 
     def _warn_anchor_miss(self, channel: str) -> None:
         """覆盖式注入锚点未命中时告警一次（每个通道）。
@@ -489,7 +556,7 @@ class MaiPersonalitySwapPlugin(MaiBotPlugin):
         self._state_store = SwapStateStore(base / "personality")
         # 导入随包预设（插件根 preset/ 暂存区 → 数据目录），幂等，每次启动检查一次
         self._import_bundled_presets()
-        await self._refresh_stream_map()
+        await self._refresh_stream_map(force=True)
         await self._warm_bot_name()
         script_loaded = 0
         if bool(self.config.script.enabled) or self._takeover_active():
@@ -501,6 +568,7 @@ class MaiPersonalitySwapPlugin(MaiBotPlugin):
         swapped = len(self._state_store.list_swapped())
         # 提前解析一次权重表：配置页 JSON 写错时在启动日志里就能看到告警
         weights = self._merged_weights()
+        await self._host_admin_ids()  # 预热宿主管理员名单缓存（供同步脚本路径）
         self._log(
             "info",
             f"夺舍麦麦已加载：预设 {len(self._preset_store.list_names())} 个，"
@@ -530,8 +598,10 @@ class MaiPersonalitySwapPlugin(MaiBotPlugin):
     ) -> None:
         """配置更新：备份上限即时生效，并重算预设权重表（解析告警重新计数）。"""
 
-        if config_scope == "self" and self._preset_store is not None:
-            self._preset_store._backup_limit = max(int(self.config.preset.backup_limit), 0)
+        if config_scope == "self":
+            if self._preset_store is not None:
+                # 经公开方法更新备份上限（不跨对象直改私有字段）
+                self._preset_store.set_backup_limit(int(self.config.preset.backup_limit))
             self._weights_parse_warned = False
             self._merged_weights()
             self._log("info", "夺舍麦麦配置已更新")
@@ -636,9 +706,19 @@ class MaiPersonalitySwapPlugin(MaiBotPlugin):
             )
         return self._state_store
 
-    async def _refresh_stream_map(self) -> None:
-        """从宿主拉取全部聊天流，构建 stream_id → 群号/QQ号 映射。"""
+    async def _refresh_stream_map(self, *, force: bool = False) -> None:
+        """从宿主拉取全部聊天流，构建 stream_id → 群号/QQ号 映射。
 
+        缓存 miss 触发时按 ``_STREAM_REFRESH_MIN_INTERVAL_SEC`` 节流：``/mps
+        status`` 是公开命令，流未入缓存时若每次都 ``chat.get_all_streams``
+        全量拉取，普通成员即可反复刷宿主接口；5 秒内只真正拉取一次。on_load
+        等确需最新数据的调用方用 ``force=True``。
+        """
+
+        now = time.monotonic()
+        if not force and (now - self._last_stream_refresh) < _STREAM_REFRESH_MIN_INTERVAL_SEC:
+            return
+        self._last_stream_refresh = now
         try:
             streams = await self.ctx.chat.get_all_streams()
         except Exception as exc:
@@ -737,8 +817,12 @@ class MaiPersonalitySwapPlugin(MaiBotPlugin):
     # 激活预设查询与权重
     # ------------------------------------------------------------------
 
-    def _active_preset_for_stream(self, stream_id: str) -> Optional[PersonaPreset]:
-        """取当前聊天流（或全局）激活的预设；主人格/未找到返回 None。"""
+    async def _active_preset_for_stream(self, stream_id: str) -> Optional[PersonaPreset]:
+        """取当前聊天流（或全局）激活的预设；主人格/未找到返回 None。
+
+        预设正文是 TOML 文件解析（同步 IO），本方法在 BLOCKING hook 内被调用
+        ——移入 ``asyncio.to_thread``，避免阻塞事件循环。
+        """
 
         if self._state_store is None or not bool(self.config.plugin.enabled):
             return None
@@ -753,7 +837,7 @@ class MaiPersonalitySwapPlugin(MaiBotPlugin):
         state = self._state_store.get(key)
         if state.is_main or not state.preset:
             return None
-        return self._preset_store.load(state.preset)
+        return await asyncio.to_thread(self._preset_store.load, state.preset)
 
     def _merged_weights(self) -> Dict[str, float]:
         """配置页「预设权重表」（JSON 文本）与 /mps weight 持久化覆盖合并（覆盖优先）。
@@ -850,6 +934,84 @@ class MaiPersonalitySwapPlugin(MaiBotPlugin):
             return self._list_allows(ctx.group_id, filter_cfg.group_list, filter_cfg.group_list_mode)
         return self._list_allows(ctx.user_id, filter_cfg.private_list, filter_cfg.private_list_mode)
 
+    def script_stream_allows(self, ctx: Any) -> bool:
+        """脚本 ``ctx.send_text`` 的黑白名单闸门（与换人格同一套 ``[filter]`` 名单）。
+
+        被拉黑的群/用户不接收脚本发出的文本；解析不到群号/用户号时放行
+        （与 ``_stream_allowed`` 的空名单口径一致）。
+        """
+
+        group_id = str(getattr(ctx, "group_id", "") or "").strip()
+        user_id = str(getattr(ctx, "user_id", "") or "").strip()
+        if not group_id and not user_id:
+            return True
+        filter_cfg = self.config.filter
+        if group_id:
+            return self._list_allows(group_id, filter_cfg.group_list, filter_cfg.group_list_mode)
+        return self._list_allows(user_id, filter_cfg.private_list, filter_cfg.private_list_mode)
+
+    def script_caller_is_admin(self, *, user_id: str = "", group_id: str = "") -> bool:
+        """脚本事件发送者的管理员判定（与 ``_is_admin_call`` 同一口径的同步版）。
+
+        供脚本（如自检工具）做"仅管理员可触发"门控：消息事件不带本地
+        operator 标记与 platform，恒按名单判定。脚本 ctx 属性是同步接口、
+        不能 await 宿主配置读取，宿主管理员侧使用缓存（``_host_admin_cache``，
+        on_load / 异步判定 / timer tick 时刷新），插件配置侧实时读取——语义与
+        异步路径一致：宿主管理员 ∪ 插件配置管理员，按纯 ID 去重。
+        """
+
+        if not bool(self.config.plugin.enabled):
+            return False
+        filter_cfg = self.config.filter
+        group_id_s = str(group_id or "").strip()
+        if group_id_s and group_id_s in {str(x).strip() for x in (filter_cfg.admin_group_ids or []) if str(x).strip()}:
+            return True
+        caller_pid = plain_id(user_id)
+        if not caller_pid:
+            return False
+        admin_ids = collect_admins(list(self._host_admin_cache), filter_cfg.admin_user_ids)
+        return caller_pid in set(admin_ids)
+
+    # ------------------------------------------------------------------
+    # 管理员名单（admin_util 统一口径）
+    # ------------------------------------------------------------------
+
+    async def _host_admin_ids(self) -> Optional[List[str]]:
+        """读取宿主管理员名单（``plugin.permission``），归一为纯 ID 列表。
+
+        成功时（含空名单）刷新 ``_host_admin_cache`` 并返回列表；读取失败时
+        返回 None（调用方降级为仅插件配置管理员）并记 debug 日志。
+        """
+
+        try:
+            perms = await self.ctx.config.get("plugin.permission", None)
+        except Exception as exc:
+            self._log("debug", f"宿主管理员名单（plugin.permission）读取失败，本次按仅插件配置管理员判定：{exc}")
+            return None
+        ids = [p for p in (plain_id(x) for x in (perms or [])) if p]
+        self._host_admin_cache = tuple(ids)
+        return ids
+
+    async def _admin_user_ids(self) -> List[str]:
+        """生效的用户管理员名单：宿主管理员 ∪ 插件配置（``admin_user_ids``）。
+
+        经 :func:`admin_util.collect_admins` 按纯 ID 去重（宿主条目在前）；
+        宿主读取失败（None）时降级为仅插件配置。含前缀形态（``qq:123456``）
+        的既有配置值经 ``plain_id`` 归一后与裸号等价。
+        """
+
+        host = await self._host_admin_ids()
+        return collect_admins(host, self.config.filter.admin_user_ids)
+
+    @property
+    def load_underscore_scripts(self) -> bool:
+        """是否加载下划线前缀脚本（配置 ``[script].load_underscore_scripts``，默认关闭）。"""
+
+        try:
+            return bool(self.config.script.load_underscore_scripts)
+        except AttributeError:
+            return False
+
     # ------------------------------------------------------------------
     # Hook：注入
     # ------------------------------------------------------------------
@@ -901,7 +1063,7 @@ class MaiPersonalitySwapPlugin(MaiBotPlugin):
 
         if not isinstance(items, list):
             return {"action": "continue"}
-        preset = self._active_preset_for_stream(session_id)
+        preset = await self._active_preset_for_stream(session_id)
         modified = dict(kwargs)
         changed = False
 
@@ -986,7 +1148,7 @@ class MaiPersonalitySwapPlugin(MaiBotPlugin):
         锚点未命中回退为 items 尾部追加。
         """
 
-        preset = self._active_preset_for_stream(session_id)
+        preset = await self._active_preset_for_stream(session_id)
         if preset is None or not isinstance(items, list):
             return {"action": "continue"}
 
@@ -1090,7 +1252,13 @@ class MaiPersonalitySwapPlugin(MaiBotPlugin):
             return
 
         script_decision = None
-        if self._script_host is not None and not bool(message.get("is_notify")):
+        # 黑白名单同样约束脚本可见性：被拉黑聊天流的消息不派发给任何脚本
+        # handler（文本/群号/用户号对脚本完全不可见），与换人格闸门口径一致
+        if (
+            self._script_host is not None
+            and not bool(message.get("is_notify"))
+            and self._stream_allowed(message)
+        ):
             message_info = message.get("message_info") if isinstance(message.get("message_info"), dict) else {}
             # 守卫必须判“取出来的那个值”，不能判 message_info 本身——上一行已保证它是 dict，
             # 判它恒为 True，`None` 会原样透传，下面 .get("group_id") 立刻崩。
@@ -1154,7 +1322,8 @@ class MaiPersonalitySwapPlugin(MaiBotPlugin):
         if self._keyword_hit(text, self.config.condition.bot_keywords):
             # 按聊天流状态键记录命中（见 ConditionTracker 注释）
             self._tracker.record_bot_hit(self.script_scope_key_sync(str(message.get("session_id") or "")))
-        if self._script_host is not None:
+        # 黑白名单同样约束脚本可见性：被拉黑聊天流的出站消息不派发给脚本
+        if self._script_host is not None and self._stream_allowed(message):
             session_id = str(message.get("session_id") or "")
             script_ctx = self._script_host.build_message_context(
                 "bot_message",
@@ -1233,7 +1402,7 @@ class MaiPersonalitySwapPlugin(MaiBotPlugin):
             if not state.is_main:
                 self.script_revert(scope=key, source="auto", trigger_stream_id=str(message.get("session_id") or ""))
             return
-        preset = self.store.load(decision.picked)
+        preset = await asyncio.to_thread(self.store.load, decision.picked)
         if preset is None:
             self._log("warning", f"抽中预设「{decision.picked}」但文件缺失，本次跳过")
             return
@@ -1380,6 +1549,9 @@ class MaiPersonalitySwapPlugin(MaiBotPlugin):
             return
         if bool(self.config.script.auto_reload):
             self._script_host.scan_and_reload()
+        # 定期刷新宿主管理员名单缓存（脚本 ctx.caller_is_admin 是同步接口，
+        # 用的是这份缓存；异步命令路径的每次判定也会顺带刷新）
+        await self._host_admin_ids()
         ctx = self._script_host.build_timer_context()
         await self._script_host.dispatch("timer", ctx)
 
@@ -1467,7 +1639,7 @@ class MaiPersonalitySwapPlugin(MaiBotPlugin):
         {"maisave", "save", "maiload", "weight", "debug", "script", "delete", "swap"}
     )
 
-    def _is_admin_call(
+    async def _is_admin_call(
         self,
         *,
         is_local_operator: bool,
@@ -1475,18 +1647,25 @@ class MaiPersonalitySwapPlugin(MaiBotPlugin):
         user_id: str,
         platform: str,
     ) -> bool:
-        """管理子命令授权判定：operator / 控制台，或配置的管理员名单命中。
+        """管理子命令授权判定：operator / 控制台，或管理员名单命中。
 
         覆盖 ``_OPERATOR_SUBS``：写预设（maisave/delete）、改权重（weight）、
         改 debug、重载脚本（script）、输出预设（maiload）、**手动切人格（swap，
         v1.4.3 起）**。``status`` / ``list`` 等只读命令不走本判定。
 
-        名单（配置 ``[filter]``，脚本接管时仍生效）：
-        - ``admin_user_ids``：QQ 号列表（也接受 ``platform:user`` 形态，
-          如 ``qq:123456``）；
-        - ``admin_group_ids``：群号列表，群内任何成员视为管理员。
+        管理员口径（cateye 系二轮统一，见 ``admin_util.py``；配置 ``[filter]``，
+        脚本接管时仍生效）：
+        - **宿主管理员**：``ctx.config.get("plugin.permission", ...)`` 名单，
+          读取失败降级为仅插件配置（debug 日志）；
+        - **插件配置管理员**：``admin_user_ids``（QQ 号列表，含 ``qq:123456``
+          前缀形态，经 ``plain_id`` 归一为纯 ID）∪ ``admin_group_ids``（群号
+          列表，群内任何成员视为管理员，语义保持）；
+        - 两侧按纯 ID 合并去重（宿主 ∪ 插件）。
 
-        配置为空 → 仅本地 operator / 控制台可用。
+        ``platform`` 参数保留以兼容既有调用形态（纯 ID 归一后不再需要拼接
+        ``platform:user`` 比对）。
+
+        两侧名单均为空 → 仅本地 operator / 控制台可用（fail-closed 不变）。
         """
 
         if is_local_operator:
@@ -1495,23 +1674,16 @@ class MaiPersonalitySwapPlugin(MaiBotPlugin):
             return False
         filter_cfg = self.config.filter
         group_id_s = str(group_id or "").strip()
-        user_id_s = str(user_id or "").strip()
-        platform_s = str(platform or "").strip().lower()
         # 群白名单：命中的群内任何成员可用
         if group_id_s and group_id_s in {str(x).strip() for x in (filter_cfg.admin_group_ids or []) if str(x).strip()}:
             return True
-        if not user_id_s:
+        # 用户侧：调用方与名单两侧都经 plain_id 归一为纯 ID 后比对
+        # （'qq:10001' 与 '10001' 视为同一人；无法归一的非纯数字 ID 不放行）
+        caller_pid = plain_id(user_id)
+        if not caller_pid:
             return False
-        # 用户白名单：支持裸 QQ 号 或 platform:user 两种形态
-        admin_users = {
-            str(x).strip()
-            for x in (filter_cfg.admin_user_ids or [])
-            if str(x).strip()
-        }
-        if user_id_s in admin_users:
-            return True
-        scoped = f"{platform_s}:{user_id_s}" if platform_s else ""
-        return bool(scoped) and scoped in admin_users
+        admin_ids = await self._admin_user_ids()
+        return caller_pid in set(admin_ids)
 
     async def _dispatch(
         self,
@@ -1558,7 +1730,7 @@ class MaiPersonalitySwapPlugin(MaiBotPlugin):
         listing_only = (
             sub in ("maisave", "save") and bool(args) and args[0].lower() == "list"
         )
-        if sub in self._OPERATOR_SUBS and not listing_only and not self._is_admin_call(
+        if sub in self._OPERATOR_SUBS and not listing_only and not await self._is_admin_call(
             is_local_operator=is_local_operator,
             group_id=group_id,
             user_id=user_id,
@@ -1567,8 +1739,7 @@ class MaiPersonalitySwapPlugin(MaiBotPlugin):
             self._log("warning", f"无权限用户尝试管理子命令 /mps {sub}（group={group_id or '-'} user={user_id or '-'}）")
             return (
                 False,
-                "该子命令仅限 bot 管理员使用（本地 operator/控制台，或 WebUI 插件配置页 "
-                "「黑白名单与管理员」中配置的管理员 QQ/群）；只读命令 /mps status、/mps list 不受限",
+                "该子命令仅限 bot 管理员使用（本地 operator/控制台，或宿主/插件配置的管理员名单）；只读命令 /mps status、/mps list 不受限",
                 True,
             )
         if sub in ("maisave", "save"):
@@ -1584,7 +1755,7 @@ class MaiPersonalitySwapPlugin(MaiBotPlugin):
         if sub == "status":
             return await self._cmd_status(
                 stream_id=stream_id,
-                is_admin=self._is_admin_call(
+                is_admin=await self._is_admin_call(
                     is_local_operator=is_local_operator,
                     group_id=group_id,
                     user_id=user_id,
@@ -1706,6 +1877,11 @@ class MaiPersonalitySwapPlugin(MaiBotPlugin):
         if weight < 0:
             return False, "权重不能是负数", True
         if weight == 0:
+            # 清除路径同样先校验：非法/不存在的名字不写 weights.json（与正权重路径一致）
+            if not validate_preset_name(name):
+                return False, "预设名称只能包含中文、字母、数字、下划线或连字符（1~64 位）", True
+            if name not in self.store.list_names():
+                return False, f"预设「{name}」不存在（用 /mps list 查看全部预设）", True
             had = name in self.state.load_weight_overrides()
             self.state.save_weight_override(name, 0)
             if had:

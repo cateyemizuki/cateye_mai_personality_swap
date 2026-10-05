@@ -50,6 +50,12 @@ Thumbs.db
 commit_template.txt
 # 插件中心 Issue 提交文档（本地使用，不随插件上传）
 ISSUE_SUBMISSION.md
+# 上传发布操作手册（agent 用，从开发文档复制，不入仓库）
+UPLOAD_AGENT.md
+# 宿主安装回执与更新备份（发布安装模式写入，勿提交）
+.maibot-release.json
+.update_backups/
+/config_back/
 
 # ── 个人人格预设与个人脚本（不进仓库）─────────────────────────
 # 插件根 preset/ 只保留 .gitkeep（交付暂存区，个人预设放本地/数据目录）
@@ -58,3 +64,16 @@ ISSUE_SUBMISSION.md
 # maips/ 随包示例进仓库（见上方 !maips/**），但个人路由脚本不上传
 /maips/lezi_lock.py
 /maips/priestess_swap.py
+
+# ---- 追加自 MaiBot插件开发文档v1.3.0/.gitignore 模板（sync 2026-10-05）----
+/config.toml
+/data/
+*.egg-info/
+build/
+dist/
+.ruff_cache/
+.mypy_cache/
+htmlcov/
+smoke_test*.py
+/tests/
+desktop.ini

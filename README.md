@@ -4,6 +4,10 @@
 自动切换或命令手动切换各聊天流的人格；替换状态持久化，重启不丢。预设激活期间
 自动忽略官方"临时说话风格"注入。
 
+> **宿主兼容**：同时兼容 MaiBot **1.2.x 与 1.3.0**（v1.4.6 起按策略A声明：
+> `host_application 1.0.0 ~ 1.99.99`、`sdk 2.0.0 ~ 2.99.99`；脚本 LLM 调用已改为
+> 显式 `task_name` 任务路由，两代宿主行为一致）。
+
 ## 最快上手（基本用法：三步，成本几乎为 0）
 
 只想「给某个群 / 某个私聊换一套人格」时，**不需要碰触发条件、概率、权重、脚本**——
@@ -86,7 +90,7 @@ duration_minutes = 0            # 0 = 一直用；>0 = 切到它后默认持续 
 | `/maisave [名称] [时长]` | 管理员 | 保存当前官方人格为预设；名称缺省自动命名 preset1/preset2…。`[时长]` 是该预设被切到时**默认持续多久后自动恢复主人格**（分钟；缺省/`0` = 永久，即切到就一直用，不自动恢复）。保存成功后用**合并转发**回显保存内容（验证 + 防刷屏）；同名覆盖前自动备份。预设文件本身永久存在、不会到期销毁 |
 | `/mps maisave delete <名称>` 或 `/mps delete <名称>`（v1.4.1） | 管理员 | 删除预设：删除前自动备份到 `preset/backup/`；若该预设正被某些聊天流激活，这些流先恢复主人格；该预设的命令级权重一并清除 |
 | `/mps maiload <名称>` | 管理员 | 合并转发输出指定预设（供复制手动修改官方人格配置） |
-| `/mps weight <名称> <权重>` | 管理员 | 设置预设权重（持久化，重启保留；与 WebUI 配置页中的预设权重合并生效，命令设置优先；权重填 0 清除命令级覆盖，回落配置页数值） |
+| `/mps weight <名称> <权重>` | 管理员 | 设置预设权重（持久化，重启保留；与 WebUI 配置页中的预设权重合并生效，命令设置优先；权重填 0 清除命令级覆盖（名称须合法且预设存在），回落配置页数值） |
 | `/mps script [list\|reload]` | 管理员 | 查看自定义脚本加载状态 / 手动热重载 |
 | `/mps debug [true\|false]` | 管理员 | 查询/切换 debug 模式（开启后每次人格变换通知触发的聊天流） |
 
@@ -138,14 +142,17 @@ E:\maibot\MaiBot\data\plugins\github.cateye.mai-personality-swap\
   触发条件/权重/预设，按默认值处理），仅插件总开关、配置版本号与黑白名单继续
   生效；自动替换行为完全由 `maips/` 脚本设定（用 `ctx.set_swap_params(...)`，
   未设定的项默认留空即不产生自动替换）；脚本引擎自动启用。
-- 群/私聊黑名单、白名单（名单为空 = 不过滤；**接管时仍生效**）
+- 群/私聊黑名单、白名单（名单为空 = 不过滤；**接管时仍生效**；v1.4.7 起同样约束**脚本可见性**：被拉黑聊天流的消息不派发给任何脚本，脚本 `ctx.send_text` 向被拉黑流发送也会被丢弃）
 - **管理员名单**（v1.3.5 起，**接管时仍生效**）：`/mps swap`（v1.4.3 起纳入）、
   `/mps maisave`（含 `/maisave`）、`weight`、`debug`、`script`、`maiload`、
   `delete` 等管理子命令仅限管理员执行；只读的 `/mps status`、`/mps list` 公开。
   管理员 = 本地 operator/控制台，或 ① 消息所在群在 `admin_group_ids`（该群任何成员可用），
-  ② 发送者 QQ 在 `admin_user_ids`（裸 QQ 号或 `platform:user`）。**两个名单都留空
+  ② 发送者 QQ 在 `admin_user_ids`（裸 QQ 号或 `platform:user`）。**注意**：管理员群
+  等于官方人格内容对该群全员可见（`/mps maisave` 会回显官方人格全文、`maiload`
+  以合并转发发回群里），请只把自己的可信群填入。**两个名单都留空
   时只有本地 operator/控制台能用管理命令**——从 QQ 群想用 `/mps swap`、`/maisave`，
   请先把你的群号/QQ 填进这两个名单之一（见上文「最快上手」第 2 步）。
+- 脚本：启用脚本 / Timer 间隔 / 自动热重载 / **加载下划线前缀脚本**（v1.4.7，默认关——下划线脚本只作工具库；运维自检工具 `_maips_selfcheck.py` 需开启本项才加载，触发仍需 debug 开启 + 管理员发送，用完即关）
 - 仅触发聊天流替换（默认开；关闭则全局替换）
 - 替换期间是否能再次触发对话（默认关）
 - 每次替换忽略当前人格，即必定变更（默认关）
@@ -167,19 +174,23 @@ E:\maibot\MaiBot\data\plugins\github.cateye.mai-personality-swap\
       items 尾部追加式**（保证人格仍生效），并在插件日志记 warning；
     - 主人格（无预设激活）时 system 原样保留；
     - 到期 / `revert` / 切回主人格后 system 恢复官方原样，仍可逆、不动官方配置文件。
-    - **预设配了 `persona_name`（自称名）时（v1.3.6/1.3.9/1.4.0 增强）**：除 replyer
-      身份段自称外，planner 模板外壳里的官方昵称也会一并换成 persona_name（决策
-      层眼里的 bot 就叫这个名），并在请求末尾注入"你现在是{persona_name}，上文中
+    - **预设配了 `persona_name`（自称名）时（v1.3.6/1.3.9/1.4.0 增强；v1.4.7 收窄）**：除
+      replyer
+      身份段自称外，planner 模板**已知外壳固定句式**里的官方昵称也会换成 persona_name
+      （决策层眼里的 bot 就叫这个名；句式外的段落不再被改写），并在请求末尾注入"你现在是{persona_name}，上文中
       {官方名}的发言是切换前旧身份说的…"的身份说明——解决切换后 bot 被自己的
       历史发言带偏、继续自称旧名的问题（详见 预设一节 persona_name 与 AGENT.md）。
   - 忽略官方临时说话风格（默认开）：预设激活期间剔除官方"你的说话风格可以尝试"
-    消息，避免与预设表达并存。
+    开头的短消息（v1.4.7 起锚定边界匹配：整条以前缀开头且 ≤200 字符才剔除，
+    用户引用/复读该文案不再被误删），避免与预设表达并存。
 
 ## 自定义maips脚本（Mai Python Script，类KubeJS）
 
 **脚本目录**：插件目录下的 `maips/` 文件夹（与 KubeJS 的 `kubejs/` 同构）。
-每个顶层 `.py` 文件是一个脚本（数量不限、全部加载；`_` 开头的视为工具库不
-加载），保存后自动热重载（或 `/mps script reload`，`/mps script list` 看状态）。
+每个顶层 `.py` 文件是一个脚本（数量不限、全部加载；`_` 开头的视为工具库**默认不
+加载**，可在配置页开启「加载下划线前缀脚本」临时启用——随包的运维自检工具
+`_maips_selfcheck.py` 即属此类，用完即关），保存后自动热重载（或
+`/mps script reload`，`/mps script list` 看状态）。
 
 ```python
 from mps_api import on_event
@@ -243,10 +254,13 @@ def nightly(ctx):
   `await ctx.llm_json(prompt, task=..)`（自动解析 JSON）、`await ctx.emotion_score(...)`
   （0~10 情绪分）、`await ctx.recent_context(n)`（最近聊天文本）。`task` 是模型任务名
   （`replyer` / `planner` / `utils` 等）。
-- **其它**：`await ctx.send_text(...)`（发文本回聊天流，仅 message/bot_message）、
+- **其它**：`await ctx.send_text(...)`（发文本回聊天流，仅 message/bot_message；目标流
+  被黑白名单拉黑时静默丢弃）、
   `ctx.log(msg)`（写插件日志）、`ctx.hour/minute/now/group_id/user_id/text/segments`。
 - **debug 门控**：`ctx.debug_enabled`（`/mps debug true|false` 控制）；自检类脚本应据此
   在 debug 关闭时静默。
+- **管理员门控**：`ctx.caller_is_admin`（消息发送者是否命中管理员名单）；自检/通知类
+  脚本应据此把触发限定在管理员，防止任意成员触发切换/LLM 消耗。
 
 ### 接管模式（脚本接管）
 
@@ -260,11 +274,14 @@ def nightly(ctx):
 - `README.md`（本文件）：命令/配置/脚本入门已合并于此（原 maips/README.md 内容）
 - `AGENT.md`（插件根目录）：面向 AI 编码助手的**完整自足契约**——事件表、ctx 方法
   签名、set_swap_params 字段表与默认值、编写守则、可直接落盘的完整配方
-- `自检指南.md`（插件根目录）：maips 全方法自检步骤（配合 `maips/maips_selfcheck.py`）
+- `自检指南.md`（插件根目录）：maips 全方法自检步骤（配合 `maips/_maips_selfcheck.py`；该脚本默认不加载，见自检指南说明）
 - 完整 API 与实现细节见 [开发文档.md](开发文档.md) "脚本系统"章节
 
 > ⚠️ 脚本与 bot 本体同等信任级别（进程内完整 Python 权限），只运行自己编写或
-> 审查过的脚本。
+> 审查过的脚本。安全模型三不变量（长期保持）：① 脚本目录（插件目录 `maips/`）
+> 仅本地可写，不提供任何经聊天写入脚本文件的功能；② 脚本重载（`/mps script
+> reload`）与下划线前缀脚本加载仅管理员可操作；③ 永不存在"聊天内容 → 文件 →
+> exec"通路（不从聊天里保存/执行脚本）。
 
 ## 用 AI 生成新人格（建议流程）
 

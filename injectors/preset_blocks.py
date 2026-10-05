@@ -9,6 +9,9 @@ from .base import InjectedBlock
 
 # 官方临时说话风格消息的固定前缀（maisaka_generator_base._build_temporary_reply_style_message）
 OFFICIAL_TEMP_STYLE_MARKER = "你的说话风格可以尝试"
+# 官方临时风格消息整条长度上限：官方消息 = 固定前缀 + 官方 reply_style 段落，
+# 远短于该上限；用户引用/复读官方文案拼出的长消息不会命中，双条件防误删
+OFFICIAL_TEMP_STYLE_MAX_CHARS = 200
 
 LABEL_EXPRESSION = "表达方式要求"
 LABEL_PERSONA = "人格约束"
@@ -65,9 +68,22 @@ def build_identity_correction_block(persona_name: str, bot_name: str) -> str:
 
 
 def is_official_temp_style_text(text: str) -> bool:
-    """判断一段 Item 文本是否为官方临时说话风格消息。"""
+    """判断一段 Item 文本是否为官方临时说话风格消息（锚定边界，防误删用户消息）。
 
-    return OFFICIAL_TEMP_STYLE_MARKER in str(text or "")
+    官方消息是**整条**以固定文案开头的 UserMessageItem（“你的说话风格可以
+    尝试：…”，见 maisaka_generator_base._build_temporary_reply_style_message）。
+    判定收紧为双条件（v1.4.7，此前是 ``in`` 子串匹配，用户消息里引用/复读该
+    文案会被整条误删）：
+
+    1. strip 后以固定前缀**开头**（起点锚定）；
+    2. 整条长度不超过 ``OFFICIAL_TEMP_STYLE_MAX_CHARS``（终点边界：官方消息
+       远短于该上限，超长基本可断定是用户拼贴的长文本）。
+    """
+
+    stripped = str(text or "").strip()
+    if not stripped.startswith(OFFICIAL_TEMP_STYLE_MARKER):
+        return False
+    return len(stripped) <= OFFICIAL_TEMP_STYLE_MAX_CHARS
 
 
 def preset_item_texts(preset: Optional[PersonaPreset]) -> str:

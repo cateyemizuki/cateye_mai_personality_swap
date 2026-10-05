@@ -15,7 +15,9 @@ r"""KubeJS 风格的自定义脚本宿主。
   信任级别等同安装一个插件；只运行自己编写或审查过的脚本。
 - 热重载：按文件 mtime 检测变化（timer 顺带检查，或 ``/mps script reload``
   手动触发）；重载时先摘除该文件注册的全部处理器再重新执行。
-- 下划线开头的文件（``_utils.py`` 之类）不作为脚本加载，可被其他脚本 import。
+- 下划线开头的文件（``_utils.py`` 之类）默认不作为脚本加载，可被其他脚本
+  import；配置 ``[script].load_underscore_scripts = true`` 时才加载执行
+  （运维自检工具用，用完即关）。
 - 错误隔离：单个处理函数异常只记日志，不影响其他脚本与 bot 主链路。
 - 加载失败的文件保持"未生效"状态，修复后下次重载自动恢复。
 
@@ -402,11 +404,41 @@ class ScriptContext:
             pass
         return False
 
+    @property
+    def caller_is_admin(self) -> bool:
+        """本事件发送者是否为管理员（宿主管理员 ∪ 配置页 admin_user_ids 名单）。
+
+        消息事件不带本地 operator 标记与 platform，恒按名单判定：宿主
+        ``plugin.permission``（缓存，见 plugin.py ``_host_admin_cache``）∪ 配置页
+        ``admin_user_ids``（裸 QQ 号，纯 ID 去重）或群号命中 ``admin_group_ids``。
+        自检/通知类脚本应把本属性与 ``ctx.debug_enabled`` 一起作为触发门槛，
+        避免任意成员触发切换/LLM 消耗。
+        """
+
+        try:
+            checker = getattr(self._host._backend, "script_caller_is_admin", None)
+            if callable(checker):
+                return bool(
+                    checker(user_id=str(self.user_id or ""), group_id=str(self.group_id or ""))
+                )
+        except Exception:
+            pass
+        return False
+
     async def send_text(self, text: str) -> None:
-        """向事件所属聊天流发送文本（仅 message/bot_message 事件可用）。"""
+        """向事件所属聊天流发送文本（仅 message/bot_message 事件可用）。
+
+        黑白名单同样约束脚本发送：目标聊天流（群/用户）被 ``[filter]`` 名单
+        拉黑时静默丢弃（不抛错，脚本无需感知名单配置）。
+        """
 
         if not self.session_id:
             raise ValueError("当前事件没有所属聊天流，无法 send_text")
+        if not self._host._backend.script_stream_allows(self):
+            self._host._backend._log(
+                "debug", f"脚本 send_text 被黑白名单拦截，已丢弃（session={self.session_id}）"
+            )
+            return
         await self._host._backend.ctx.send.text(str(text), self.session_id)
 
     # -- 消息类型与精细匹配 ------------------------------------------------
@@ -626,7 +658,10 @@ class ScriptContext:
         temperature / max_tokens 限制生成行为。
         """
 
-        payload: Dict[str, Any] = {"prompt": str(prompt), "model": str(task)}
+        # 显式 task_name 任务路由（勿用 model="任务名" 写法）：SDK 2.8.1（宿主 1.2.x）
+        # 会强制发送 task_name="utils"，"只传 model=任务名" 在 1.2.x 上报"未找到模型"；
+        # 显式 task_name 在 1.2.x（SDK 2.8.1）与 1.3.0（SDK 2.8.2）上行为一致。
+        payload: Dict[str, Any] = {"prompt": str(prompt), "task_name": str(task)}
         if temperature is not None:
             payload["temperature"] = float(temperature)
         if max_tokens is not None:
@@ -808,12 +843,15 @@ class ScriptHost:
         self._last_scan_at = now
 
         self._dir.mkdir(parents=True, exist_ok=True)
+        # 下划线前缀脚本默认不加载（工具库）；仅当后端显式开启
+        # （配置 [script].load_underscore_scripts，运维自检工具用）才加载
+        load_underscore = bool(getattr(self._backend, "load_underscore_scripts", False))
         seen: Dict[str, Tuple[float, int]] = {}
         loaded = 0
         unchanged = 0
         for path in sorted(self._dir.glob("*.py")):
-            if path.name.startswith("_"):
-                continue  # 下划线开头 = 工具库，不作为脚本加载
+            if path.name.startswith("_") and not load_underscore:
+                continue  # 下划线开头 = 工具库，默认不作为脚本加载
             try:
                 stat = path.stat()
             except OSError:

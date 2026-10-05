@@ -36,6 +36,20 @@ REPLYER_ANCHOR_B = "你可以参考【回复信息参考】中的信息"
 PLANNER_STYLE_MARK = "的行为风格："
 PLANNER_TAIL_MARK = "\n以上"  # "以上 {bot_name}的行为风格可以帮助你更好地决策"
 
+# planner 外壳固定句式（zh-CN 模板；{name} 为官方昵称占位）。persona_name 的
+# 外壳人格化只作用于这些已知句式（与行为段 marker 行），**不再对整段 system
+# 做全文替换**——避免宿主在 system 其它段落（安全/合规指令等）写到官方昵称时
+# 被一并改写。句式未命中（宿主模板改版）→ 该处外壳保持官方昵称，保守降级。
+# 句式依据宿主 maisaka_chat.prompt 实测渲染（见 开发文档.md §4.3）。
+PLANNER_SHELL_SENTENCES = (
+    "{name}的行为风格：",  # 行为段 marker 行（锚点已消费，仅随外壳统一人格化）
+    "你需要关注{name}与用户的对话来为{name}选择正确的动作和行为",
+    "你不是{name}本人，不要替{name}发言",
+    "帮{name}搜集信息",
+    "当你判断{name}现在应该正式发言时调用 reply",
+    "以上{name}的行为风格可以帮助你更好地决策",  # 行为段收尾固定句
+)
+
 # 身份段（identity）健全性阈值：官方身份段是"名字行 + 官方人格 + 情绪尾巴"，
 # 远小于下列上限。锚点之前的整段会被删除，因此超过阈值即视为"宿主模板结构已
 # 变化"（例如在锚点前新增了安全规则 / 输出格式 / 群规段落）→ 放弃替换，由
@@ -140,13 +154,17 @@ def replace_planner_system_text(
     ``shell_name``（v1.3.9，人格化外壳）：宿主 planner 模板把 ``{bot_name}``
     （官方昵称）写满外壳——“关注 {bot_name} 与用户的对话”“为 {bot_name} 选择
     动作”“你不是 {bot_name} 本人”“帮{bot_name}搜集信息”等。预设配置了
-    ``persona_name`` 时，传该值即可在替换行为段后，把整段文本里出现的官方
-    昵称一并替换为 persona_name（外壳也随之人格化，决策模型眼里的 bot 指称
-    从官方昵称变成 persona_name）。为空 → 只换行为段（旧行为）。
+    ``persona_name`` 时，传该值即可把**已知外壳句式**里出现的官方昵称一并替换
+    为 persona_name（外壳随之人格化，决策模型眼里的 bot 指称从官方昵称变成
+    persona_name）。为空 → 只换行为段（旧行为）。
 
-    替换采用整词匹配（前后不得紧邻 ASCII 字母/数字/下划线），且官方昵称长度
-    小于 2 时**放弃外壳替换**——单字昵称（如「小」「麦」）做全局子串替换会误改
-    system 里其它无关文本，此时只替换行为段（保守降级）。
+    外壳替换范围（v1.4.7 收窄）：只替换 :data:`PLANNER_SHELL_SENTENCES` 列出的
+    官方模板固定句式内的官方昵称，**不再对整段 system 做全文整词替换**——此前
+    的全文替换会把 system 中其它含昵称的段落（如宿主安全/合规指令）一并改写。
+    替换仍采用整词匹配（前后不得紧邻 ASCII 字母/数字/下划线），且官方昵称长度
+    小于 2 时**放弃外壳替换**——单字昵称（如「小」「麦」）做子串替换会误改
+    system 里其它无关文本，此时只替换行为段（保守降级）。宿主模板改版导致
+    句式未命中 → 该处外壳保持官方昵称（行为段替换不受影响）。
 
     找不到相应锚点时返回 None（回退追加）。
     """
@@ -169,13 +187,29 @@ def replace_planner_system_text(
     new_behavior = str(preset_behavior or "").strip()
     replaced = f"{normalized[:idx]}{mark}{new_behavior}{normalized[tail:]}"
 
-    # 人格化外壳：把官方昵称替换为 persona_name（若提供、不同、且不是单字昵称）。
-    # 注意此时行为段 marker 行的“{官方名}的行为风格：”仍含官方名，也会被一并
-    # 换成 persona_name——行为段锚点已消费，不再参与二次定位，安全。
+    # 人格化外壳：把官方昵称在已知外壳句式内替换为 persona_name（若提供、
+    # 不同、且不是单字昵称）。注意行为段 marker 行的“{官方名}的行为风格：”
+    # 也在句式表内，会被一并换成 persona_name——行为段锚点已消费，不再参与
+    # 二次定位，安全。
     if shell and bot and shell != bot and len(bot) >= 2:
-        pattern = re.compile(r"(?<![0-9A-Za-z_])" + re.escape(bot) + r"(?![0-9A-Za-z_])")
-        replaced = pattern.sub(lambda _match: shell, replaced)
+        replaced = _personalize_shell(replaced, bot, shell)
     return replaced
+
+
+def _personalize_shell(text: str, bot: str, shell: str) -> str:
+    """在 :data:`PLANNER_SHELL_SENTENCES` 各句式内把官方昵称替换为 persona_name。
+
+    对每个句式构造匹配（昵称两侧允许模板渲染产生的空白），命中后仅把命中片段
+    内整词出现的官方昵称换成 persona_name，句式外的文本一律不动。
+    """
+
+    word_pattern = re.compile(r"(?<![0-9A-Za-z_])" + re.escape(bot) + r"(?![0-9A-Za-z_])")
+    for template in PLANNER_SHELL_SENTENCES:
+        chunks = [re.escape(part) for part in template.split("{name}")]
+        name_group = rf"\s*{re.escape(bot)}\s*"
+        pattern = re.compile(name_group.join(chunks))
+        text = pattern.sub(lambda match: word_pattern.sub(shell, match.group(0)), text)
+    return text
 
 
 def rewrite_first_system_item(

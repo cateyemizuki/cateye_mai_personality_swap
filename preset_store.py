@@ -85,6 +85,11 @@ class PresetStore:
         self._base_dir = Path(base_dir)
         self._backup_limit = max(int(backup_limit), 0)
 
+    def set_backup_limit(self, limit: int) -> None:
+        """更新备份上限（配置热更新入口；外部经公开方法调整，不直改私有字段）。"""
+
+        self._backup_limit = max(int(limit), 0)
+
     @property
     def base_dir(self) -> Path:
         """预设目录。"""

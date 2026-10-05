@@ -1,5 +1,106 @@
 # 更新日志
 
+## 1.4.7
+
+> 2026-09-29 安全与规范加固（市场 #680 审核中提交，本次改动涉及 manifest
+> description 与新增配置字段，**需要审核侧 recheck**）。配置版本
+> `1.4.6 → 1.4.7`（只增元数据，旧配置自动兼容）。
+
+### 安全：自检脚本默认不加载 + 触发需管理员（防止任意成员触发人格切换/LLM 消耗）
+
+随包的 `maips/maips_selfcheck.py` 改名为 `maips/_maips_selfcheck.py`：下划线
+前缀脚本**默认不作为脚本加载**（只作工具库），需自检时在 WebUI 配置页开启新增
+的「加载下划线前缀脚本」（`[script].load_underscore_scripts`，默认 `false`）
+并重载插件。同时脚本触发路径加双重门控：debug 开启（原有）**且**消息发送者
+命中管理员名单（`ctx.caller_is_admin`，复用 `admin_user_ids` / `admin_group_ids`
+口径）——此前 debug 开启期间，任意群成员发「自检切换」「自检LLM」等触发词即可
+让脚本连续 `ctx.swap`/`ctx.revert` 翻动人格、真实调用 LLM 消耗 token。自检完成
+后建议关闭该配置与 debug（用完即关）。
+
+### 修复：`/mps weight <名> 0` 清除路径不再无校验写盘
+
+权重为 0（清除命令级覆盖）的路径此前直接 `save_weight_override(name, 0)`，任意
+超长/特殊字符串都能进 `weights.json` 键。现与正权重路径一致：先过预设名白名单
+（`validate_preset_name`），且预设存在才写，否则回「名称非法/预设不存在」提示。
+
+### 收紧：黑白名单覆盖脚本事件派发与脚本 `ctx.send_text`
+
+`[filter]` 黑白名单此前只约束内置自动抽取与脚本 `ctx.swap`/`ctx.revert`；被拉黑
+聊天流的消息仍会派发给全部脚本 handler，脚本也可向被拉黑聊天流 `send_text`。现
+在：被拉黑流的入站/出站消息**不再派发给任何脚本**（对脚本完全不可见），脚本
+`ctx.send_text` 的目标流被拉黑时静默丢弃。与文档「黑白名单（接管时仍生效）」
+口径完全对齐。
+
+### 收紧：persona_name 外壳替换不再全文替换 system
+
+配置 `persona_name` 的预设激活时，planner system 里官方昵称的人格化替换此前是
+对**整段 system** 做整词替换——若宿主模板在 system 其它段落（安全/合规指令等）
+也写到官方昵称会被一并改写。现收窄为只替换 `injectors/system_replace.py` 中
+`PLANNER_SHELL_SENTENCES` 列出的官方模板已知固定句式（行为段 marker 行、"关注
+…与用户的对话…"、"你不是…本人…"、"帮…搜集信息"、"当你判断…应该正式发言时
+调用 reply"、行为段收尾句）；句式未命中（宿主模板改版）该处保持官方昵称，
+行为段替换不受影响。
+
+### 修复：官方临时风格剔除改锚定边界匹配，不再误删用户消息
+
+`is_official_temp_style_text` 此前用 `in` 子串判定——预设激活期间，任何包含
+「你的说话风格可以尝试」的用户消息（引用、复读、测试官方文案）会被整条从请求
+上下文剔除。现改为双条件：strip 后以固定前缀**开头** 且整条长度 ≤200 字符
+（官方消息远短于该上限），用户引用/复读不再命中。
+
+### 性能：BLOCKING hook 内同步 IO 移出事件循环 + stream 映射刷新节流
+
+- BLOCKING hook（`before_model_request` / planner `before_request`）内的预设
+  TOML 解析移入 `asyncio.to_thread`，不再阻塞事件循环（自动抽取路径的预设读取
+  同步处理）；
+- stream→群号/QQ号 映射的全量刷新（`chat.get_all_streams`）加 5 秒节流——缓存
+  miss 时（典型：公开命令 `/mps status` 在流未入缓存时）不会每次都全量拉取宿主
+  接口，普通成员无法反复刷该调用。
+
+### 规范：manifest 瘦身与配置热更新、鉴权细节
+
+- `_manifest.json` description 精简为一段功能概述（版本史全部留在 CHANGELOG），
+  新增 `"changelog": "CHANGELOG.md"` 字段；**本次 manifest 改动需 recheck**；
+- 管理员名单 `platform:user` 形态匹配两侧统一 strip+lower（`QQ:123` 与 `qq:123`
+  等价，此前大写 platform 写法匹配失败）；
+- 管理员判定统一（cateye 系 2026-09-29 二轮）：生效管理员 = 宿主管理员
+  （`ctx.config.get("plugin.permission")`）∪ 插件配置 `admin_user_ids`，经
+  `admin_util.py`（随包分发的统一模块）纯 ID 归一去重（带 `qq:` 前缀与裸号视为
+  同一人）；宿主名单读取失败降级为仅插件配置（debug 日志）。本地 operator/控制台
+  放行、`admin_group_ids`（群内任何人可用）语义与"无任何名单时仅本地 operator
+  可用"的 fail-closed 行为均保持不变；脚本 `ctx.caller_is_admin` 同口径
+  （宿主侧经缓存，on_load / 命令判定 / timer tick 刷新）；
+- `on_config_update` 改经新增的 `PresetStore.set_backup_limit()` 公开方法更新
+  备份上限，不再跨对象直改私有字段。
+
+## 1.4.6
+
+> 1.3.0 兼容自查修复，无功能语义变化。配置版本 `1.4.5 → 1.4.6`（只增元数据，
+> 旧配置自动兼容）；manifest 兼容区间按策略A放宽，继续同时兼容 1.2.x 与 1.3.0。
+
+### 修复：脚本 LLM 调用改为显式 task_name 任务路由（规避 1.2.x 与 1.3.0 的路由差异）
+
+`script_host.py` 的 `llm_generate`（脚本的 `ctx.llm_generate` / `ctx.emotion_score` /
+`ctx.llm_json` 都走这里）原来写的是 `llm.generate(prompt, model=任务名)`——
+「只传 `model="任务名"`」的写法在 1.3.0（SDK 2.8.2）能命中任务名兼容分支，但 1.2.x
+（SDK 2.8.1）会无条件强制发送 `task_name="utils"`，宿主把 `replyer` 等任务名当具体
+模型名查找，报「未找到模型」。现改为显式 `task_name=` 传任务（不传 `model`），按
+开发文档 §8.3 的正确写法，1.2.x 与 1.3.0 行为一致。
+
+### 修复：配置模型补齐 WebUI 英文翻译
+
+按 v1.3.0 开发文档 §5.1 的强制要求：全部 23 个配置字段的 `json_schema_extra` 补上
+`i18n`（至少 `en` 的 label/hint），8 个配置分组补上 `__ui_i18n__`（英文 title/
+description）。此前英文界面会把英文字段名直接当标题展示。
+
+### manifest 调整
+
+- `host_application.min_version`：`1.2.0 → 1.0.0`（策略A：min 是硬下限，按规范写
+  `1.0.0`；实际并未使用任何 1.2.0 独有 API，放宽后 1.0.x/1.1.x 宿主也可尝试加载）；
+- `sdk.min_version` 维持 `2.0.0`（未照抄 2.8.2；插件实际用到的 ctx 代理均为早期
+  SDK 即有能力，显式 `task_name` 经 `**kwargs` 透传在旧 SDK 同样支持）；
+- `max_version` 维持 `1.99.99` / `2.99.99`，覆盖 1.3.0。
+
 ## 1.4.5
 
 > 修复一处**只在私聊暴露**的判空缺陷。功能语义不变，配置版本 `1.4.4 → 1.4.5`
