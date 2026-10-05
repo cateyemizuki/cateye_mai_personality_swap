@@ -1,9 +1,16 @@
-# maips 方法自检脚本 —— 覆盖 AGENT.md 第 4/5 节列出的 ctx 能力
+# maips 方法自检脚本 —— 覆盖 AGENT.md 第 4/5 节列出的 ctx 能力（运维自检工具）
 #
-# ⚠️ 门控：仅在 debug 模式开启（/mps debug true）时响应；debug 关闭时所有
-# 触发词与事件日志全部静默忽略，不影响正常聊天。
+# ⚠️ 本文件名以下划线开头（_maips_selfcheck.py）：**默认不加载**（下划线前缀
+# 只作工具库）。需要自检时在 WebUI 配置页开启「加载下划线前缀脚本」
+# （[script].load_underscore_scripts = true）并重载插件；自检完成后**用完即关**。
 #
-# debug 开启后在群里发下面的触发词，脚本执行对应方法，并把每步结果通过
+# ⚠️ 双重门控（缺一不可）：
+# 1. debug 开启（/mps debug true）——关闭时所有触发词与事件日志全部静默忽略；
+# 2. 仅管理员触发——消息发送者须命中配置页「管理员 QQ/群」名单
+#    （ctx.caller_is_admin），非管理员发触发词一律静默（不响应、不发送、
+#    不调用 LLM），防止任意成员翻动人格/消耗 token。
+#
+# 开启后在群里发下面的触发词，脚本执行对应方法，并把每步结果通过
 # ctx.send_text 发回**当前聊天流**，方便逐项对照验收（LLM 类会真实调模型耗
 # token，慎用）：
 #
@@ -19,8 +26,8 @@
 #   自检LLM              recent_context / emotion_score / llm_generate / llm_json
 #   自检swap事件         提示后用 /mps swap <预设> 触发，观察日志/swap 事件
 #
-# 触发词可带任意前后缀；脚本按"包含"匹配。测试完可保留本文件（不影响其它
-# 脚本），不需要时直接删除即可。
+# 触发词可带任意前后缀；脚本按"包含"匹配。测试完建议：关闭
+# load_underscore_scripts 与 debug（/mps debug false），保留本文件不影响其它脚本。
 
 import json
 
@@ -206,8 +213,9 @@ async def _check_at(ctx) -> list:
 async def maips_selfcheck(ctx):
     if ctx.is_command or ctx.is_notify:
         return
-    # debug 未开启：自检功能全部静默忽略（不响应、不发送、不调用 LLM）
-    if not ctx.debug_enabled:
+    # 双重门控：debug 未开启或发送者非管理员 → 全部静默忽略（不响应、不发送、
+    # 不调用 LLM），防止任意成员触发人格切换/LLM 消耗
+    if not ctx.debug_enabled or not ctx.caller_is_admin:
         return
     text = ctx.text or ""
     keyword = None
